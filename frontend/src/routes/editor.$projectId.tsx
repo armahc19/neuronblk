@@ -36,18 +36,62 @@ type PlacedBlock = {
   values: Record<string, string>;
 };
 
-type Connection = { id: string; from: string; to: string };
+/**
+ * Port model:
+ * - "in"       top,    target — every block
+ * - "out"      bottom, source — start/input/output/process blocks
+ * - "true"     right,  source — conditions (diamond) only
+ * - "false"    bottom, source — conditions (diamond) only
+ * - "loopback" left,   target — loops (diamond) only; a body block's "out"
+ *              connects here to represent "repeat".
+ */
+type PortId = "in" | "out" | "true" | "false" | "loopback";
+
+type Connection = {
+  id: string;
+  from: string;
+  fromPort: PortId;
+  to: string;
+  toPort: PortId;
+};
 
 const BLOCK_W = 260;
-// Approximate anchor height used only for connector-line math; actual
-// rendered block height can vary slightly (auto), which is fine visually.
-const BLOCK_H = 100;
 
-function portOut(b: PlacedBlock) {
-  return { x: b.x + BLOCK_W / 2, y: b.y + BLOCK_H };
+// Approximate rendered height per shape category, used only for connector
+// anchor math. Actual DOM height can vary slightly (auto), which is fine
+// visually — these just need to be close.
+const SHAPE_H: Record<string, number> = {
+  start: 64, // h-16 oval
+  input: 96, // h-24 parallelogram
+  output: 96,
+  conditions: 120, // diamond
+  loops: 120, // diamond
+};
+const DEFAULT_H = 96; // process rectangle min-height
+
+function shapeHeight(category: string) {
+  return SHAPE_H[category] ?? DEFAULT_H;
 }
-function portIn(b: PlacedBlock) {
-  return { x: b.x + BLOCK_W / 2, y: b.y };
+
+function getPortPos(block: PlacedBlock, category: string, portId: PortId) {
+  const h = shapeHeight(category);
+  const cx = block.x + BLOCK_W / 2;
+  switch (portId) {
+    case "in":
+      return { x: cx, y: block.y };
+    case "out":
+    case "false":
+      return { x: cx, y: block.y + h };
+    case "true":
+      return { x: block.x + BLOCK_W, y: block.y + h / 2 };
+    case "loopback":
+      return { x: block.x, y: block.y + h / 2 };
+  }
+}
+
+function blockPortPos(b: PlacedBlock, portId: PortId) {
+  const def = getBlockDef(b.defId);
+  return getPortPos(b, def?.category ?? "process", portId);
 }
 
 function Editor() {
@@ -59,8 +103,8 @@ function Editor() {
   const [query, setQuery] = useState("");
   const [placed, setPlaced] = useState<PlacedBlock[]>([]);
   const [connections, setConnections] = useState<Connection[]>([]);
-  const [pending, setPending] = useState<{ from: string; x: number; y: number } | null>(null);
-  const hoveredInputRef = useRef<string | null>(null);
+  const [pending, setPending] = useState<{ from: string; fromPort: PortId; x: number; y: number } | null>(null);
+  const hoveredPortRef = useRef<{ blockId: string; portId: PortId } | null>(null);
   const [bottomOpen, setBottomOpen] = useState(true);
   const [running, setRunning] = useState(false);
   const [logs, setLogs] = useState<string[]>([]);
@@ -170,15 +214,16 @@ function Editor() {
     setConnections((prev) => prev.filter((c) => c.from !== id && c.to !== id));
   }
 
-  function startConnect(fromId: string, clientX: number, clientY: number) {
+  function startConnect(fromId: string, fromPort: PortId, clientX: number, clientY: number) {
     const rect = canvasRef.current!.getBoundingClientRect();
     const scrollLeft = canvasRef.current!.scrollLeft;
     const scrollTop = canvasRef.current!.scrollTop;
-    setPending({ from: fromId, x: clientX - rect.left + scrollLeft, y: clientY - rect.top + scrollTop });
+    setPending({ from: fromId, fromPort, x: clientX - rect.left + scrollLeft, y: clientY - rect.top + scrollTop });
     const move = (ev: MouseEvent) => {
       const r = canvasRef.current!.getBoundingClientRect();
       setPending({
         from: fromId,
+        fromPort,
         x: ev.clientX - r.left + canvasRef.current!.scrollLeft,
         y: ev.clientY - r.top + canvasRef.current!.scrollTop,
       });
@@ -186,14 +231,18 @@ function Editor() {
     const up = () => {
       window.removeEventListener("mousemove", move);
       window.removeEventListener("mouseup", up);
-      const target = hoveredInputRef.current;
-      if (target && target !== fromId) {
+      const target = hoveredPortRef.current;
+      if (target && target.blockId !== fromId) {
         setConnections((prev) => [
-          ...prev.filter((c) => !(c.to === target) && !(c.from === fromId)),
-          { id: crypto.randomUUID(), from: fromId, to: target },
+          ...prev.filter(
+            (c) =>
+              !(c.to === target.blockId && c.toPort === target.portId) &&
+              !(c.from === fromId && c.fromPort === fromPort),
+          ),
+          { id: crypto.randomUUID(), from: fromId, fromPort, to: target.blockId, toPort: target.portId },
         ]);
       }
-      hoveredInputRef.current = null;
+      hoveredPortRef.current = null;
       setPending(null);
     };
     window.addEventListener("mousemove", move);
@@ -318,29 +367,60 @@ function Editor() {
           >
             {/* Connection lines */}
             <svg className="pointer-events-none absolute left-0 top-0 h-full w-full overflow-visible">
+              <defs>
+                <marker
+                  id="loopback-arrow"
+                  viewBox="0 0 10 10"
+                  refX="8"
+                  refY="5"
+                  markerWidth="7"
+                  markerHeight="7"
+                  orient="auto-start-reverse"
+                >
+                  <path d="M0,0 L10,5 L0,10 z" fill="#8b5cf6" />
+                </marker>
+              </defs>
               {connections.map((c) => {
                 const from = blockById.get(c.from);
                 const to = blockById.get(c.to);
                 if (!from || !to) return null;
-                return (
-                  <path
-                    key={c.id}
-                    d={bezier(portOut(from), portIn(to))}
-                    fill="none"
-                    stroke="var(--color-primary)"
-                    strokeWidth={2}
-                  />
-                );
+                const a = blockPortPos(from, c.fromPort);
+                const b = blockPortPos(to, c.toPort);
+
+                if (c.toPort === "loopback") {
+                  return (
+                    <path
+                      key={c.id}
+                      d={elbowPath(a, b)}
+                      fill="none"
+                      stroke="#8b5cf6"
+                      strokeWidth={2}
+                      strokeDasharray="5 4"
+                      markerEnd="url(#loopback-arrow)"
+                    />
+                  );
+                }
+
+                const stroke =
+                  c.fromPort === "true" ? "#10b981" : c.fromPort === "false" ? "#f43f5e" : "var(--color-primary)";
+                return <path key={c.id} d={bezier(a, b)} fill="none" stroke={stroke} strokeWidth={2} />;
               })}
               {pending &&
                 (() => {
                   const from = blockById.get(pending.from);
                   if (!from) return null;
+                  const a = blockPortPos(from, pending.fromPort);
+                  const stroke =
+                    pending.fromPort === "true"
+                      ? "#10b981"
+                      : pending.fromPort === "false"
+                        ? "#f43f5e"
+                        : "var(--color-primary)";
                   return (
                     <path
-                      d={bezier(portOut(from), { x: pending.x, y: pending.y })}
+                      d={bezier(a, { x: pending.x, y: pending.y })}
                       fill="none"
-                      stroke="var(--color-primary)"
+                      stroke={stroke}
                       strokeWidth={2}
                       strokeDasharray="4 4"
                     />
@@ -356,9 +436,9 @@ function Editor() {
                 onRemove={() => removeBlock(b.instanceId)}
                 onMove={(x, y) => updateBlock(b.instanceId, { x, y })}
                 onFieldChange={(field, value) => updateValue(b.instanceId, field, value)}
-                onStartConnect={(x, y) => startConnect(b.instanceId, x, y)}
-                onInputPortEnter={() => (hoveredInputRef.current = b.instanceId)}
-                onInputPortLeave={() => (hoveredInputRef.current = null)}
+                onStartConnect={(portId, x, y) => startConnect(b.instanceId, portId, x, y)}
+                onPortEnter={(portId) => (hoveredPortRef.current = { blockId: b.instanceId, portId })}
+                onPortLeave={() => (hoveredPortRef.current = null)}
                 connecting={!!pending && pending.from !== b.instanceId}
               />
             ))}
@@ -519,8 +599,10 @@ function DraggableBlock({ block, color }: { block: BlockDef; color: string }) {
 
 /**
  * Renders a block on the canvas in the same shape/color as its sidebar
- * counterpart: oval (start), skewed parallelogram (input/output),
- * diamond (conditions/loops), or rounded rectangle (everything else).
+ * counterpart, with ports matching its role in the flowchart:
+ * - start/input/output/process: in (top), out (bottom)
+ * - conditions (diamond): in (top), true (right), false (bottom)
+ * - loops (diamond): in (top), out (bottom, loop body), loopback (left)
  */
 function CanvasBlock({
   block,
@@ -528,17 +610,17 @@ function CanvasBlock({
   onMove,
   onFieldChange,
   onStartConnect,
-  onInputPortEnter,
-  onInputPortLeave,
+  onPortEnter,
+  onPortLeave,
   connecting,
 }: {
   block: PlacedBlock;
   onRemove: () => void;
   onMove: (x: number, y: number) => void;
   onFieldChange: (field: string, value: string) => void;
-  onStartConnect: (clientX: number, clientY: number) => void;
-  onInputPortEnter: () => void;
-  onInputPortLeave: () => void;
+  onStartConnect: (portId: PortId, clientX: number, clientY: number) => void;
+  onPortEnter: (portId: PortId) => void;
+  onPortLeave: () => void;
   connecting: boolean;
 }) {
   const def = getBlockDef(block.defId);
@@ -625,7 +707,9 @@ function CanvasBlock({
           style={{ transform: "translate(-50%, -50%) rotate(45deg)" }}
         />
         <div className="relative z-10 flex flex-col items-center gap-1 px-6 text-center">
-          <div className="text-[9px] font-bold uppercase tracking-wider text-white/80">Decision</div>
+          <div className="text-[9px] font-bold uppercase tracking-wider text-white/80">
+            {category === "loops" ? "Loop" : "Decision"}
+          </div>
           {fieldsContent}
         </div>
       </div>
@@ -639,17 +723,19 @@ function CanvasBlock({
     );
   }
 
+  const showOut = category !== "conditions" && block.defId !== "start.stop";
+
   return (
     <div
       className="group absolute select-none"
       style={{ left: block.x, top: block.y, width: BLOCK_W }}
       onMouseDown={startDrag}
     >
-      {/* Input port (top) */}
+      {/* Input port (top) — every block */}
       <div
         data-no-drag
-        onMouseEnter={onInputPortEnter}
-        onMouseLeave={onInputPortLeave}
+        onMouseEnter={() => onPortEnter("in")}
+        onMouseLeave={onPortLeave}
         className={cn(
           "absolute left-1/2 top-0 z-10 h-3.5 w-3.5 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-background bg-muted transition-all",
           connecting && "scale-125 bg-primary shadow-lift",
@@ -671,17 +757,72 @@ function CanvasBlock({
         <X className="h-3 w-3" />
       </button>
 
-      {/* Output port (bottom) */}
-      <div
-        data-no-drag
-        onMouseDown={(e) => {
-          e.stopPropagation();
-          e.preventDefault();
-          onStartConnect(e.clientX, e.clientY);
-        }}
-        className="absolute left-1/2 bottom-0 z-10 h-4 w-4 -translate-x-1/2 translate-y-1/2 cursor-crosshair rounded-full border-2 border-background bg-primary shadow-soft transition-transform hover:scale-125"
-        title="Drag to connect"
-      />
+      {category === "conditions" ? (
+        <>
+          {/* True port (right side) */}
+          <div
+            data-no-drag
+            onMouseDown={(e) => {
+              e.stopPropagation();
+              e.preventDefault();
+              onStartConnect("true", e.clientX, e.clientY);
+            }}
+            className="absolute right-0 top-1/2 z-10 h-4 w-4 translate-x-1/2 -translate-y-1/2 cursor-crosshair rounded-full border-2 border-background bg-emerald-500 shadow-soft transition-transform hover:scale-125"
+            title="True"
+          />
+          <span className="pointer-events-none absolute right-[-18px] top-[calc(50%+10px)] text-[9px] font-bold text-emerald-600">
+            T
+          </span>
+
+          {/* False port (bottom) */}
+          <div
+            data-no-drag
+            onMouseDown={(e) => {
+              e.stopPropagation();
+              e.preventDefault();
+              onStartConnect("false", e.clientX, e.clientY);
+            }}
+            className="absolute left-1/2 bottom-0 z-10 h-4 w-4 -translate-x-1/2 translate-y-1/2 cursor-crosshair rounded-full border-2 border-background bg-rose-500 shadow-soft transition-transform hover:scale-125"
+            title="False"
+          />
+          <span className="pointer-events-none absolute left-[calc(50%+12px)] -bottom-1 text-[9px] font-bold text-rose-600">
+            F
+          </span>
+        </>
+      ) : (
+        <>
+          {category === "loops" && (
+            <>
+              {/* Loop-back port (left side) — connect a body block's output here */}
+              <div
+                data-no-drag
+                onMouseEnter={() => onPortEnter("loopback")}
+                onMouseLeave={onPortLeave}
+                className={cn(
+                  "absolute left-0 top-1/2 z-10 h-3.5 w-3.5 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-background bg-violet-400 transition-all",
+                  connecting && "scale-125 bg-violet-500 shadow-lift",
+                )}
+                title="Loop back"
+              />
+              <span className="pointer-events-none absolute -left-4 top-[calc(50%-16px)] text-[11px] text-violet-500">
+                ↺
+              </span>
+            </>
+          )}
+          {showOut && (
+            <div
+              data-no-drag
+              onMouseDown={(e) => {
+                e.stopPropagation();
+                e.preventDefault();
+                onStartConnect("out", e.clientX, e.clientY);
+              }}
+              className="absolute left-1/2 bottom-0 z-10 h-4 w-4 -translate-x-1/2 translate-y-1/2 cursor-crosshair rounded-full border-2 border-background bg-primary shadow-soft transition-transform hover:scale-125"
+              title={category === "loops" ? "Loop body" : "Output"}
+            />
+          )}
+        </>
+      )}
     </div>
   );
 }
@@ -749,22 +890,39 @@ function renderTemplate(template: string, fields: BlockField[]): Seg[] {
   return out.filter((s) => (s.type === "text" ? s.value.length > 0 : true));
 }
 
+/** Smooth flow connector (true/false branches and normal in→out flow). */
 function bezier(a: { x: number; y: number }, b: { x: number; y: number }) {
   const dy = Math.max(40, Math.abs(b.y - a.y) * 0.5);
-  const c1x = a.x;
-  const c1y = a.y + dy;
-  const c2x = b.x;
-  const c2y = b.y - dy;
+  const dx = Math.max(20, Math.abs(b.x - a.x) * 0.3);
+  const goingSideways = Math.abs(b.x - a.x) > Math.abs(b.y - a.y);
+  const c1x = goingSideways ? a.x + dx : a.x;
+  const c1y = goingSideways ? a.y : a.y + dy;
+  const c2x = goingSideways ? b.x - dx : b.x;
+  const c2y = goingSideways ? b.y : b.y - dy;
   return `M ${a.x} ${a.y} C ${c1x} ${c1y}, ${c2x} ${c2y}, ${b.x} ${b.y}`;
 }
 
+/** Right-angle "goes around" connector used for loop-back arrows. */
+function elbowPath(a: { x: number; y: number }, b: { x: number; y: number }) {
+  const dropY = a.y + 28;
+  const sideX = Math.min(a.x, b.x) - 40;
+  return `M ${a.x} ${a.y} L ${a.x} ${dropY} L ${sideX} ${dropY} L ${sideX} ${b.y} L ${b.x} ${b.y}`;
+}
+
+/**
+ * Execution order for code gen / Run: DFS from root blocks (no incoming
+ * connection), following every outgoing branch (true/false/loop body).
+ * The visited guard means loop-back cycles terminate safely instead of
+ * looping forever.
+ */
 function orderByConnections(blocks: PlacedBlock[], connections: Connection[]): PlacedBlock[] {
   if (blocks.length === 0) return blocks;
   const byId = new Map(blocks.map((b) => [b.instanceId, b]));
-  const next = new Map<string, string>();
+  const outgoing = new Map<string, Connection[]>();
   const hasIncoming = new Set<string>();
   for (const c of connections) {
-    next.set(c.from, c.to);
+    if (!outgoing.has(c.from)) outgoing.set(c.from, []);
+    outgoing.get(c.from)!.push(c);
     hasIncoming.add(c.to);
   }
   const roots = blocks.filter((b) => !hasIncoming.has(b.instanceId));
@@ -776,10 +934,11 @@ function orderByConnections(blocks: PlacedBlock[], connections: Connection[]): P
     const b = byId.get(id);
     if (!b) return;
     result.push(b);
-    const n = next.get(id);
-    if (n) walk(n);
+    const outs = outgoing.get(id) ?? [];
+    for (const c of outs) walk(c.to);
   };
   roots.sort((a, b) => a.y - b.y || a.x - b.x).forEach((r) => walk(r.instanceId));
+  // Any leftover (disconnected components) — append in insertion order
   blocks.forEach((b) => walk(b.instanceId));
   return result;
 }
@@ -891,13 +1050,13 @@ function generatePython(projectName: string | undefined, blocks: PlacedBlock[]) 
           return `    result = ${v.a || "a"} ${op} ${v.b || "b"}`;
         }
         case "if.then":
-          return `    if ${v.cond || "True"}:\n        pass`;
+          return `    if ${v.cond || "True"}:\n        pass  # True branch\n    else:\n        pass  # False branch`;
         case "if.compare":
           return `    _ = (${v.a || "a"} ${v.op || "=="} ${v.b || "b"})`;
         case "loop.for":
-          return `    for ${v.item || "item"} in ${v.list || "items"}:\n        pass`;
+          return `    for ${v.item || "item"} in ${v.list || "items"}:\n        pass  # loop body`;
         case "loop.while":
-          return `    while ${v.cond || "True"}:\n        pass`;
+          return `    while ${v.cond || "True"}:\n        pass  # loop body`;
         case "fn.define":
           return `    def ${v.name || "my_func"}(${v.args || ""}):\n        pass`;
         case "fn.call":
