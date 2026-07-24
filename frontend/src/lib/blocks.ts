@@ -1,4 +1,4 @@
-import { Boxes, Play, Variable, Type, Terminal, GitBranch, Repeat, FunctionSquare, FileText, Cloud, Sparkles, Database } from "lucide-react";
+import { Boxes, Play, Variable, Type, Terminal, GitBranch, Repeat, FunctionSquare, FileText, Cloud, Sparkles, Database, CircleDot } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
 export type BlockField =
@@ -183,6 +183,21 @@ export const BLOCK_CATEGORIES: BlockCategory[] = [
         description: "Repeat while true",
         template: "while {cond}",
         fields: [{ name: "cond", kind: "text", placeholder: "running", default: "running", width: 140 }],
+      },
+    ],
+  },
+  {
+    id: "connectors",
+    name: "Connectors",
+    icon: CircleDot,
+    color: "connector",
+    blocks: [
+      {
+        id: "flow.connector",
+        label: "Connector",
+        category: "connector",
+        description: "Jump / merge point — links branches or a loop's exit to what runs next",
+        template: "•",
       },
     ],
   },
