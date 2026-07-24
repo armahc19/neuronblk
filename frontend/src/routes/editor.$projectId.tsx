@@ -81,10 +81,10 @@ function getPortPos(block: PlacedBlock, category: string, portId: PortId) {
     case "in":
       return { x: cx, y: block.y };
     case "out":
-    case "false":
       return { x: cx, y: block.y + h };
     case "true":
       return { x: block.x + BLOCK_W, y: block.y + h / 2 };
+    case "false":
     case "loopback":
       return { x: block.x, y: block.y + h / 2 };
   }
@@ -799,7 +799,7 @@ function CanvasBlock({
             T
           </span>
 
-          {/* False port (bottom) */}
+          {/* False port (left side) */}
           <div
             data-no-drag
             onMouseDown={(e) => {
@@ -807,10 +807,10 @@ function CanvasBlock({
               e.preventDefault();
               onStartConnect("false", e.clientX, e.clientY);
             }}
-            className="absolute left-1/2 bottom-0 z-10 h-4 w-4 -translate-x-1/2 translate-y-1/2 cursor-crosshair rounded-full border-2 border-background bg-rose-500 shadow-soft transition-transform hover:scale-125"
+            className="absolute left-0 top-1/2 z-10 h-4 w-4 -translate-x-1/2 -translate-y-1/2 cursor-crosshair rounded-full border-2 border-background bg-rose-500 shadow-soft transition-transform hover:scale-125"
             title="False"
           />
-          <span className="pointer-events-none absolute left-[calc(50%+12px)] -bottom-1 text-[9px] font-bold text-rose-600">
+          <span className="pointer-events-none absolute left-[-18px] top-[calc(50%+10px)] text-[9px] font-bold text-rose-600">
             F
           </span>
         </>
