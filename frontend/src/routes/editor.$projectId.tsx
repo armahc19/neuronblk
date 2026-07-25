@@ -20,6 +20,9 @@ import {
   Maximize,
   RotateCcw,
   AlertTriangle,
+  FileDown,
+  FileJson,
+  FileUp,
   X,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -467,6 +470,116 @@ function Editor() {
     toast.success("Project saved", { description: "Stored locally and queued to sync." });
   }
 
+  function downloadBlob(content: string, mimeType: string, filename: string) {
+    const blob = new Blob([content], { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  function safeFileName(name: string) {
+    return (name || "project").trim().replace(/[^a-z0-9_\-]+/gi, "_") || "project";
+  }
+
+  function downloadPython() {
+    downloadBlob(generatedPython, "text/x-python", `${safeFileName(project?.name)}.py`);
+  }
+
+  function exportFlowchart() {
+    const payload = {
+      format: "neuronblk-flowchart",
+      version: 1,
+      name: project?.name ?? "Untitled",
+      exportedAt: new Date().toISOString(),
+      blocks: placed,
+      connections,
+    };
+    downloadBlob(JSON.stringify(payload, null, 2), "application/json", `${safeFileName(project?.name)}.neuronblk.json`);
+  }
+
+  const importInputRef = useRef<HTMLInputElement>(null);
+
+  const VALID_PORT_IDS = new Set<string>(["in", "out", "true", "false", "loopback"]);
+  function isPortId(v: unknown): v is PortId {
+    return typeof v === "string" && VALID_PORT_IDS.has(v);
+  }
+
+  async function handleImportFile(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = ""; // reset so re-selecting the same file still fires onChange
+    if (!file) return;
+
+    let data: any;
+    try {
+      data = JSON.parse(await file.text());
+    } catch {
+      toast.error("Import failed", { description: "That file isn't valid JSON." });
+      return;
+    }
+
+    const rawBlocks = Array.isArray(data?.blocks) ? data.blocks : null;
+    const rawConns = Array.isArray(data?.connections) ? data.connections : null;
+    if (!rawBlocks || !rawConns) {
+      toast.error("Invalid file", { description: "This doesn't look like a NeuronBLK flowchart export." });
+      return;
+    }
+
+    // Validate each block/connection's shape so malformed or hand-edited
+    // JSON can't crash the canvas — anything that doesn't fit is dropped
+    // rather than rendered.
+    const validBlocks: PlacedBlock[] = rawBlocks
+      .filter(
+        (b: any) =>
+          b &&
+          typeof b.instanceId === "string" &&
+          typeof b.defId === "string" &&
+          typeof b.x === "number" &&
+          typeof b.y === "number" &&
+          !!getBlockDef(b.defId),
+      )
+      .map((b: any) => ({
+        instanceId: b.instanceId,
+        defId: b.defId,
+        x: b.x,
+        y: b.y,
+        values: b.values && typeof b.values === "object" ? b.values : {},
+      }));
+    const validIds = new Set(validBlocks.map((b) => b.instanceId));
+    const validConns: Connection[] = rawConns.filter(
+      (c: any) =>
+        c &&
+        typeof c.id === "string" &&
+        validIds.has(c.from) &&
+        validIds.has(c.to) &&
+        isPortId(c.fromPort) &&
+        isPortId(c.toPort),
+    );
+
+    const droppedBlocks = rawBlocks.length - validBlocks.length;
+    const droppedConns = rawConns.length - validConns.length;
+
+    commitHistory({ placed, connections });
+    setPlaced(validBlocks);
+    setConnections(validConns);
+    setSelectedIds(new Set());
+    resetZoom();
+
+    if (droppedBlocks > 0 || droppedConns > 0) {
+      toast.warning("Imported with some issues", {
+        description: `Loaded ${validBlocks.length} block(s). Skipped ${droppedBlocks} invalid block(s) and ${droppedConns} invalid connection(s).`,
+      });
+    } else {
+      toast.success("Flowchart imported", {
+        description: `${validBlocks.length} block${validBlocks.length === 1 ? "" : "s"} loaded.`,
+      });
+    }
+  }
+
   // Debounced autosave: persist canvas edits ~800ms after the user stops
   // dragging/typing, so work survives a refresh without needing a manual
   // Save click. The skipNextAutosaveRef guard (reset per project load,
@@ -648,6 +761,30 @@ function Editor() {
             <Save className="mr-1.5 h-3.5 w-3.5" />
             Save
           </Button>
+          <div className="ml-1 h-5 w-px bg-border" />
+          <button
+            onClick={exportFlowchart}
+            className="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
+            aria-label="Export flowchart as JSON"
+            title="Export flowchart (.json)"
+          >
+            <FileJson className="h-4 w-4" />
+          </button>
+          <button
+            onClick={() => importInputRef.current?.click()}
+            className="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
+            aria-label="Import flowchart from JSON"
+            title="Import flowchart (.json)"
+          >
+            <FileUp className="h-4 w-4" />
+          </button>
+          <input
+            ref={importInputRef}
+            type="file"
+            accept="application/json"
+            onChange={handleImportFile}
+            className="hidden"
+          />
           <div className="ml-1 h-5 w-px bg-border" />
           <button
             className="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
@@ -882,6 +1019,7 @@ function Editor() {
             python={generatedPython}
             terminal={terminal}
             logs={logs}
+            onDownloadPython={downloadPython}
           />
         </div>
 
@@ -1483,6 +1621,12 @@ function computeValidation(blocks: PlacedBlock[], connections: Connection[]): Va
         addIssue(b.instanceId, { severity: "error", message: 'Missing "No" (False) connection.' });
       }
     }
+
+    // Rule: a Loop block needs something wired to its body (the "out"
+    // port) — otherwise there's nothing to actually repeat.
+    if (def.category === "loops" && outs.size === 0) {
+      addIssue(b.instanceId, { severity: "warning", message: "Loop has no body connected." });
+    }
   }
 
   // Rule: unreachable blocks — dead code that exists and may even wire
@@ -1593,12 +1737,14 @@ function BottomPanel({
   python,
   terminal,
   logs,
+  onDownloadPython,
 }: {
   open: boolean;
   onToggle: () => void;
   python: string;
   terminal: string[];
   logs: string[];
+  onDownloadPython: () => void;
 }) {
   return (
     <div
@@ -1623,13 +1769,23 @@ function BottomPanel({
               Logs
             </TabsTrigger>
           </TabsList>
-          <button
-            onClick={onToggle}
-            className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
-            aria-label={open ? "Collapse panel" : "Expand panel"}
-          >
-            {open ? <ChevronDown className="h-4 w-4" /> : <ChevronUp className="h-4 w-4" />}
-          </button>
+          <div className="flex items-center gap-1">
+            <button
+              onClick={onDownloadPython}
+              className="flex h-7 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-muted-foreground hover:bg-muted hover:text-foreground"
+              title="Download generated Python (.py)"
+            >
+              <FileDown className="h-3.5 w-3.5" />
+              Download .py
+            </button>
+            <button
+              onClick={onToggle}
+              className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
+              aria-label={open ? "Collapse panel" : "Expand panel"}
+            >
+              {open ? <ChevronDown className="h-4 w-4" /> : <ChevronUp className="h-4 w-4" />}
+            </button>
+          </div>
         </div>
         {open && (
           <div className="min-h-0 flex-1 overflow-hidden">
