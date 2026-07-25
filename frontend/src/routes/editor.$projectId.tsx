@@ -15,6 +15,10 @@ import {
   Sparkles,
   Undo2,
   Redo2,
+  ZoomIn,
+  ZoomOut,
+  Maximize,
+  RotateCcw,
   X,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -167,28 +171,239 @@ function Editor() {
     setHistoryTick((t) => t + 1);
   }, []);
 
+  // ---- Canvas camera (pan/zoom) ----
+  const MIN_SCALE = 0.2;
+  const MAX_SCALE = 2.5;
+  const [camera, setCamera] = useState({ scale: 1, panX: 0, panY: 0 });
+  const cameraRef = useRef(camera);
   useEffect(() => {
+    cameraRef.current = camera;
+  }, [camera]);
+
+  const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
+
+  /** Converts a viewport-relative mouse position (clientX/Y) into world
+   * (canvas content) coordinates, accounting for the current pan/zoom. */
+  const screenToWorld = useCallback((clientX: number, clientY: number) => {
+    const rect = canvasRef.current!.getBoundingClientRect();
+    const cam = cameraRef.current;
+    return {
+      x: (clientX - rect.left - cam.panX) / cam.scale,
+      y: (clientY - rect.top - cam.panY) / cam.scale,
+    };
+  }, []);
+
+  const zoomIn = () => setCamera((c) => ({ ...c, scale: clamp(c.scale + 0.15, MIN_SCALE, MAX_SCALE) }));
+  const zoomOut = () => setCamera((c) => ({ ...c, scale: clamp(c.scale - 0.15, MIN_SCALE, MAX_SCALE) }));
+  const resetZoom = () => setCamera({ scale: 1, panX: 0, panY: 0 });
+
+  function fitToScreen() {
+    const rect = canvasRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    if (placed.length === 0) {
+      resetZoom();
+      return;
+    }
+    const heights = placed.map((b) => shapeHeight(getBlockDef(b.defId)?.category ?? "process"));
+    const minX = Math.min(...placed.map((b) => b.x));
+    const minY = Math.min(...placed.map((b) => b.y));
+    const maxX = Math.max(...placed.map((b) => b.x + BLOCK_W));
+    const maxY = Math.max(...placed.map((b, i) => b.y + heights[i]));
+    const contentW = Math.max(1, maxX - minX);
+    const contentH = Math.max(1, maxY - minY);
+    const rawScale = Math.min(rect.width / contentW, rect.height / contentH) * 0.85;
+    const scale = clamp(rawScale, MIN_SCALE, MAX_SCALE);
+    const panX = rect.width / 2 - ((minX + maxX) / 2) * scale;
+    const panY = rect.height / 2 - ((minY + maxY) / 2) * scale;
+    setCamera({ scale, panX, panY });
+  }
+
+  useEffect(() => {
+    const el = canvasRef.current;
+    if (!el) return;
+    function onWheel(e: WheelEvent) {
+      e.preventDefault();
+      const rect = el!.getBoundingClientRect();
+      const cam = cameraRef.current;
+      const cursorX = e.clientX - rect.left;
+      const cursorY = e.clientY - rect.top;
+      const worldX = (cursorX - cam.panX) / cam.scale;
+      const worldY = (cursorY - cam.panY) / cam.scale;
+      const delta = -e.deltaY * 0.0015;
+      const newScale = clamp(cam.scale * (1 + delta), MIN_SCALE, MAX_SCALE);
+      setCamera({
+        scale: newScale,
+        panX: cursorX - worldX * newScale,
+        panY: cursorY - worldY * newScale,
+      });
+    }
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, []);
+
+  /** Middle-mouse drag, or left-click drag while Space is held, pans the
+   * canvas. A left-click on empty canvas (no block/port under it) clears
+   * the current selection instead. */
+  function handleCanvasMouseDown(e: React.MouseEvent) {
+    const isMiddle = e.button === 1;
+    const isSpaceLeftDrag = e.button === 0 && spaceDownRef.current;
+    if (isMiddle || isSpaceLeftDrag) {
+      e.preventDefault();
+      const startX = e.clientX;
+      const startY = e.clientY;
+      const startCam = cameraRef.current;
+      const move = (ev: MouseEvent) => {
+        setCamera({ scale: startCam.scale, panX: startCam.panX + (ev.clientX - startX), panY: startCam.panY + (ev.clientY - startY) });
+      };
+      const up = () => {
+        window.removeEventListener("mousemove", move);
+        window.removeEventListener("mouseup", up);
+      };
+      window.addEventListener("mousemove", move);
+      window.addEventListener("mouseup", up);
+      return;
+    }
+    if (e.button === 0 && !(e.target as HTMLElement).closest("[data-block]")) {
+      setSelectedIds(new Set());
+    }
+  }
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  function handleSelectBlock(id: string, shiftKey: boolean) {
+    setSelectedIds((prev) => {
+      if (shiftKey) {
+        const next = new Set(prev);
+        if (next.has(id)) next.delete(id);
+        else next.add(id);
+        return next;
+      }
+      return new Set([id]);
+    });
+  }
+
+  // ---- Space-to-pan ----
+  const [spaceDown, setSpaceDown] = useState(false);
+  const spaceDownRef = useRef(false);
+
+  // ---- Copy / paste / duplicate clipboard ----
+  const clipboardRef = useRef<{ blocks: PlacedBlock[]; connections: Connection[] } | null>(null);
+
+  function getSelectionSnapshot(ids: Set<string>) {
+    const blocks = placed.filter((b) => ids.has(b.instanceId));
+    const conns = connections.filter((c) => ids.has(c.from) && ids.has(c.to));
+    return { blocks, connections: conns };
+  }
+
+  function cloneWithNewIds(blocks: PlacedBlock[], conns: Connection[], dx: number, dy: number) {
+    const idMap = new Map<string, string>();
+    const newBlocks = blocks.map((b) => {
+      const newId = crypto.randomUUID();
+      idMap.set(b.instanceId, newId);
+      return { ...b, instanceId: newId, x: b.x + dx, y: b.y + dy, values: { ...b.values } };
+    });
+    const newConns = conns.map((c) => ({
+      id: crypto.randomUUID(),
+      from: idMap.get(c.from)!,
+      fromPort: c.fromPort,
+      to: idMap.get(c.to)!,
+      toPort: c.toPort,
+    }));
+    return { blocks: newBlocks, connections: newConns };
+  }
+
+  function copySelection() {
+    if (selectedIds.size === 0) return;
+    clipboardRef.current = getSelectionSnapshot(selectedIds);
+  }
+
+  function pasteClipboard() {
+    const clip = clipboardRef.current;
+    if (!clip || clip.blocks.length === 0) return;
+    commitHistory({ placed, connections });
+    const { blocks: newBlocks, connections: newConns } = cloneWithNewIds(clip.blocks, clip.connections, 32, 32);
+    setPlaced((prev) => [...prev, ...newBlocks]);
+    setConnections((prev) => [...prev, ...newConns]);
+    setSelectedIds(new Set(newBlocks.map((b) => b.instanceId)));
+    // Step the clipboard's reference position so repeated pastes cascade
+    // diagonally instead of stacking exactly on top of each other.
+    clipboardRef.current = { blocks: newBlocks, connections: newConns };
+  }
+
+  function duplicateSelection() {
+    if (selectedIds.size === 0) return;
+    const snap = getSelectionSnapshot(selectedIds);
+    if (snap.blocks.length === 0) return;
+    commitHistory({ placed, connections });
+    const { blocks: newBlocks, connections: newConns } = cloneWithNewIds(snap.blocks, snap.connections, 32, 32);
+    setPlaced((prev) => [...prev, ...newBlocks]);
+    setConnections((prev) => [...prev, ...newConns]);
+    setSelectedIds(new Set(newBlocks.map((b) => b.instanceId)));
+  }
+
+  function removeBlocks(ids: Set<string>) {
+    if (ids.size === 0) return;
+    commitHistory({ placed, connections });
+    setPlaced((prev) => prev.filter((b) => !ids.has(b.instanceId)));
+    setConnections((prev) => prev.filter((c) => !ids.has(c.from) && !ids.has(c.to)));
+    setSelectedIds(new Set());
+  }
+
+  useEffect(() => {
+    function isEditableTarget(target: EventTarget | null) {
+      const el = target as HTMLElement | null;
+      return !!el && (el.tagName === "INPUT" || el.tagName === "SELECT" || el.tagName === "TEXTAREA");
+    }
+
     function onKeyDown(e: KeyboardEvent) {
-      const target = e.target as HTMLElement | null;
-      const isEditableFocused =
-        target && (target.tagName === "INPUT" || target.tagName === "SELECT" || target.tagName === "TEXTAREA");
-      // Let native undo work inside text fields (e.g. name editing) —
-      // only intercept for canvas-level history otherwise.
-      if (isEditableFocused) return;
+      if (e.code === "Space" && !isEditableTarget(e.target)) {
+        e.preventDefault(); // avoid page scroll
+        spaceDownRef.current = true;
+        setSpaceDown(true);
+        return;
+      }
+
+      if (isEditableTarget(e.target)) return; // let native behavior work inside text fields
+
+      if (e.key === "Delete" || e.key === "Backspace") {
+        if (selectedIds.size > 0) {
+          e.preventDefault();
+          removeBlocks(selectedIds);
+        }
+        return;
+      }
 
       const mod = e.metaKey || e.ctrlKey;
       if (!mod) return;
-      if (e.key.toLowerCase() === "z" && !e.shiftKey) {
+      const key = e.key.toLowerCase();
+      if (key === "z" && !e.shiftKey) {
         e.preventDefault();
         undo();
-      } else if ((e.key.toLowerCase() === "z" && e.shiftKey) || e.key.toLowerCase() === "y") {
+      } else if ((key === "z" && e.shiftKey) || key === "y") {
         e.preventDefault();
         redo();
+      } else if (key === "c") {
+        copySelection();
+      } else if (key === "v") {
+        pasteClipboard();
+      } else if (key === "d") {
+        e.preventDefault(); // otherwise the browser bookmarks the page
+        duplicateSelection();
       }
     }
+
+    function onKeyUp(e: KeyboardEvent) {
+      if (e.code === "Space") {
+        spaceDownRef.current = false;
+        setSpaceDown(false);
+      }
+    }
+
     window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [undo, redo]);
+    window.addEventListener("keyup", onKeyUp);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+    };
+  }, [undo, redo, selectedIds, placed, connections]);
 
   useEffect(() => {
     let cancelled = false;
@@ -298,12 +513,9 @@ function Editor() {
     const raw = e.dataTransfer.getData("application/x-neuronblk-block");
     if (!raw) return;
     const def = JSON.parse(raw) as BlockDef;
-    const rect = canvasRef.current?.getBoundingClientRect();
-    if (!rect) return;
-    const scrollLeft = canvasRef.current?.scrollLeft ?? 0;
-    const scrollTop = canvasRef.current?.scrollTop ?? 0;
-    const x = e.clientX - rect.left + scrollLeft - BLOCK_W / 2;
-    const y = e.clientY - rect.top + scrollTop - 24;
+    const world = screenToWorld(e.clientX, e.clientY);
+    const x = world.x - BLOCK_W / 2;
+    const y = world.y - 24;
     const values: Record<string, string> = {};
     def.fields?.forEach((f) => {
       values[f.name] = f.default ?? "";
@@ -325,25 +537,12 @@ function Editor() {
     );
   }
 
-  function removeBlock(id: string) {
-    commitHistory({ placed, connections });
-    setPlaced((prev) => prev.filter((b) => b.instanceId !== id));
-    setConnections((prev) => prev.filter((c) => c.from !== id && c.to !== id));
-  }
-
   function startConnect(fromId: string, fromPort: PortId, clientX: number, clientY: number) {
-    const rect = canvasRef.current!.getBoundingClientRect();
-    const scrollLeft = canvasRef.current!.scrollLeft;
-    const scrollTop = canvasRef.current!.scrollTop;
-    setPending({ from: fromId, fromPort, x: clientX - rect.left + scrollLeft, y: clientY - rect.top + scrollTop });
+    const start = screenToWorld(clientX, clientY);
+    setPending({ from: fromId, fromPort, x: start.x, y: start.y });
     const move = (ev: MouseEvent) => {
-      const r = canvasRef.current!.getBoundingClientRect();
-      setPending({
-        from: fromId,
-        fromPort,
-        x: ev.clientX - r.left + canvasRef.current!.scrollLeft,
-        y: ev.clientY - r.top + canvasRef.current!.scrollTop,
-      });
+      const w = screenToWorld(ev.clientX, ev.clientY);
+      setPending({ from: fromId, fromPort, x: w.x, y: w.y });
     };
     const up = () => {
       window.removeEventListener("mousemove", move);
@@ -503,88 +702,107 @@ function Editor() {
         <div className="flex min-w-0 flex-1 flex-col">
           <div
             ref={canvasRef}
-            className="relative min-h-0 flex-1 overflow-auto bg-background bg-[radial-gradient(circle,_var(--color-border)_1px,_transparent_1px)] [background-size:20px_20px]"
+            className="relative min-h-0 flex-1 overflow-hidden bg-background"
+            style={{
+              backgroundImage: "radial-gradient(circle, var(--color-border) 1px, transparent 1px)",
+              backgroundSize: `${20 * camera.scale}px ${20 * camera.scale}px`,
+              backgroundPosition: `${camera.panX}px ${camera.panY}px`,
+              cursor: spaceDown ? "grab" : "default",
+            }}
             onDragOver={handleDragOver}
             onDrop={handleDrop}
+            onMouseDown={handleCanvasMouseDown}
           >
-            {/* Connection lines */}
-            <svg className="pointer-events-none absolute left-0 top-0 h-full w-full overflow-visible">
-              <defs>
-                <marker
-                  id="loopback-arrow"
-                  viewBox="0 0 10 10"
-                  refX="8"
-                  refY="5"
-                  markerWidth="7"
-                  markerHeight="7"
-                  orient="auto-start-reverse"
-                >
-                  <path d="M0,0 L10,5 L0,10 z" fill="#8b5cf6" />
-                </marker>
-              </defs>
-              {connections.map((c) => {
-                const from = blockById.get(c.from);
-                const to = blockById.get(c.to);
-                if (!from || !to) return null;
-                const a = blockPortPos(from, c.fromPort);
-                const b = blockPortPos(to, c.toPort);
+            <div
+              className="absolute left-0 top-0 h-0 w-0"
+              style={{
+                transform: `translate(${camera.panX}px, ${camera.panY}px) scale(${camera.scale})`,
+                transformOrigin: "0 0",
+              }}
+            >
+              {/* Connection lines */}
+              <svg className="pointer-events-none absolute left-0 top-0 overflow-visible">
+                <defs>
+                  <marker
+                    id="loopback-arrow"
+                    viewBox="0 0 10 10"
+                    refX="8"
+                    refY="5"
+                    markerWidth="7"
+                    markerHeight="7"
+                    orient="auto-start-reverse"
+                  >
+                    <path d="M0,0 L10,5 L0,10 z" fill="#8b5cf6" />
+                  </marker>
+                </defs>
+                {connections.map((c) => {
+                  const from = blockById.get(c.from);
+                  const to = blockById.get(c.to);
+                  if (!from || !to) return null;
+                  const a = blockPortPos(from, c.fromPort);
+                  const b = blockPortPos(to, c.toPort);
 
-                if (c.toPort === "loopback") {
-                  return (
-                    <path
-                      key={c.id}
-                      d={elbowPath(a, b)}
-                      fill="none"
-                      stroke="#8b5cf6"
-                      strokeWidth={2}
-                      strokeDasharray="5 4"
-                      markerEnd="url(#loopback-arrow)"
-                    />
-                  );
-                }
+                  if (c.toPort === "loopback") {
+                    return (
+                      <path
+                        key={c.id}
+                        d={elbowPath(a, b)}
+                        fill="none"
+                        stroke="#8b5cf6"
+                        strokeWidth={2}
+                        strokeDasharray="5 4"
+                        markerEnd="url(#loopback-arrow)"
+                      />
+                    );
+                  }
 
-                const stroke =
-                  c.fromPort === "true" ? "#10b981" : c.fromPort === "false" ? "#f43f5e" : "var(--color-primary)";
-                return <path key={c.id} d={bezier(a, b)} fill="none" stroke={stroke} strokeWidth={2} />;
-              })}
-              {pending &&
-                (() => {
-                  const from = blockById.get(pending.from);
-                  if (!from) return null;
-                  const a = blockPortPos(from, pending.fromPort);
                   const stroke =
-                    pending.fromPort === "true"
-                      ? "#10b981"
-                      : pending.fromPort === "false"
-                        ? "#f43f5e"
-                        : "var(--color-primary)";
-                  return (
-                    <path
-                      d={bezier(a, { x: pending.x, y: pending.y })}
-                      fill="none"
-                      stroke={stroke}
-                      strokeWidth={2}
-                      strokeDasharray="4 4"
-                    />
-                  );
-                })()}
-            </svg>
+                    c.fromPort === "true" ? "#10b981" : c.fromPort === "false" ? "#f43f5e" : "var(--color-primary)";
+                  return <path key={c.id} d={bezier(a, b)} fill="none" stroke={stroke} strokeWidth={2} />;
+                })}
+                {pending &&
+                  (() => {
+                    const from = blockById.get(pending.from);
+                    if (!from) return null;
+                    const a = blockPortPos(from, pending.fromPort);
+                    const stroke =
+                      pending.fromPort === "true"
+                        ? "#10b981"
+                        : pending.fromPort === "false"
+                          ? "#f43f5e"
+                          : "var(--color-primary)";
+                    return (
+                      <path
+                        d={bezier(a, { x: pending.x, y: pending.y })}
+                        fill="none"
+                        stroke={stroke}
+                        strokeWidth={2}
+                        strokeDasharray="4 4"
+                      />
+                    );
+                  })()}
+              </svg>
 
-            {/* Placed blocks */}
-            {placed.map((b) => (
-              <CanvasBlock
-                key={b.instanceId}
-                block={b}
-                onRemove={() => removeBlock(b.instanceId)}
-                onMove={(x, y) => updateBlock(b.instanceId, { x, y })}
-                onFieldChange={(field, value) => updateValue(b.instanceId, field, value)}
-                onStartConnect={(portId, x, y) => startConnect(b.instanceId, portId, x, y)}
-                onPortEnter={(portId) => (hoveredPortRef.current = { blockId: b.instanceId, portId })}
-                onPortLeave={() => (hoveredPortRef.current = null)}
-                onBeforeChange={() => commitHistory({ placed, connections })}
-                connecting={!!pending && pending.from !== b.instanceId}
-              />
-            ))}
+              {/* Placed blocks */}
+              {placed.map((b) => (
+                <CanvasBlock
+                  key={b.instanceId}
+                  block={b}
+                  selected={selectedIds.has(b.instanceId)}
+                  onSelect={(shiftKey) => handleSelectBlock(b.instanceId, shiftKey)}
+                  panModeActive={spaceDown}
+                  screenToWorld={screenToWorld}
+                  onRemove={() => removeBlocks(new Set([b.instanceId]))}
+                  onMove={(x, y) => updateBlock(b.instanceId, { x, y })}
+                  onFieldChange={(field, value) => updateValue(b.instanceId, field, value)}
+                  onStartConnect={(portId, x, y) => startConnect(b.instanceId, portId, x, y)}
+                  onPortEnter={(portId) => (hoveredPortRef.current = { blockId: b.instanceId, portId })}
+                  onPortLeave={() => (hoveredPortRef.current = null)}
+                  onBeforeChange={() => commitHistory({ placed, connections })}
+                  connecting={!!pending && pending.from !== b.instanceId}
+                />
+              ))}
+            </div>
 
             {placed.length === 0 && (
               <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
@@ -593,6 +811,46 @@ function Editor() {
                 </p>
               </div>
             )}
+
+            {/* Zoom / pan toolbar */}
+            <div className="absolute bottom-4 right-4 z-30 flex items-center gap-0.5 rounded-lg border border-border bg-surface/95 px-1.5 py-1 shadow-lift backdrop-blur">
+              <button
+                onClick={zoomOut}
+                className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
+                title="Zoom out"
+                aria-label="Zoom out"
+              >
+                <ZoomOut className="h-3.5 w-3.5" />
+              </button>
+              <span className="w-10 text-center text-[11px] font-medium tabular-nums text-muted-foreground">
+                {Math.round(camera.scale * 100)}%
+              </span>
+              <button
+                onClick={zoomIn}
+                className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
+                title="Zoom in"
+                aria-label="Zoom in"
+              >
+                <ZoomIn className="h-3.5 w-3.5" />
+              </button>
+              <div className="mx-1 h-4 w-px bg-border" />
+              <button
+                onClick={resetZoom}
+                className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
+                title="Reset zoom"
+                aria-label="Reset zoom"
+              >
+                <RotateCcw className="h-3.5 w-3.5" />
+              </button>
+              <button
+                onClick={fitToScreen}
+                className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
+                title="Fit to screen"
+                aria-label="Fit to screen"
+              >
+                <Maximize className="h-3.5 w-3.5" />
+              </button>
+            </div>
           </div>
 
           <BottomPanel
@@ -762,6 +1020,10 @@ function CanvasBlock({
   onPortEnter,
   onPortLeave,
   onBeforeChange,
+  selected,
+  onSelect,
+  panModeActive,
+  screenToWorld,
   connecting,
 }: {
   block: PlacedBlock;
@@ -774,6 +1036,12 @@ function CanvasBlock({
   /** Called once, right before a drag or field edit begins, to commit an
    * undo/redo snapshot of the pre-change state. */
   onBeforeChange: () => void;
+  selected: boolean;
+  onSelect: (shiftKey: boolean) => void;
+  /** True while Space is held — drag should pan the canvas instead of
+   * moving this block. */
+  panModeActive: boolean;
+  screenToWorld: (clientX: number, clientY: number) => { x: number; y: number };
   connecting: boolean;
 }) {
   const def = getBlockDef(block.defId);
@@ -809,13 +1077,18 @@ function CanvasBlock({
   );
 
   const startDrag = (e: React.MouseEvent) => {
+    if (e.button !== 0) return; // left-click only — let middle-click bubble to canvas panning
+    if (panModeActive) return; // Space held — let it bubble to canvas panning instead
     if ((e.target as HTMLElement).closest("[data-no-drag]")) return;
+    onSelect(e.shiftKey);
     onBeforeChange();
     dragging.current = true;
-    dragOffset.current = { x: e.clientX - block.x, y: e.clientY - block.y };
+    const startWorld = screenToWorld(e.clientX, e.clientY);
+    dragOffset.current = { x: startWorld.x - block.x, y: startWorld.y - block.y };
     const move = (ev: MouseEvent) => {
       if (!dragging.current) return;
-      onMove(Math.max(0, ev.clientX - dragOffset.current.x), Math.max(0, ev.clientY - dragOffset.current.y));
+      const w = screenToWorld(ev.clientX, ev.clientY);
+      onMove(Math.max(0, w.x - dragOffset.current.x), Math.max(0, w.y - dragOffset.current.y));
     };
     const up = () => {
       dragging.current = false;
@@ -888,8 +1161,16 @@ function CanvasBlock({
 
   return (
     <div
+      data-block
       className="group absolute select-none"
-      style={{ left: block.x, top: block.y, width: BLOCK_W }}
+      style={{
+        left: block.x,
+        top: block.y,
+        width: BLOCK_W,
+        outline: selected ? "2px solid var(--color-primary)" : "none",
+        outlineOffset: 4,
+        borderRadius: 12,
+      }}
       onMouseDown={startDrag}
     >
       {/* Input port (top) — every block */}
