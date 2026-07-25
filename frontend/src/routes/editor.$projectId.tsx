@@ -1,5 +1,5 @@
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Boxes,
   Play,
@@ -13,6 +13,8 @@ import {
   TerminalSquare,
   ScrollText,
   Sparkles,
+  Undo2,
+  Redo2,
   X,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -117,6 +119,10 @@ function Editor() {
   useEffect(() => {
     placedRef.current = placed;
   }, [placed]);
+  const connectionsRef = useRef<Connection[]>(connections);
+  useEffect(() => {
+    connectionsRef.current = connections;
+  }, [connections]);
   // Guards the autosave effect below against firing on the initial load
   // itself — without this, hydrating state from storage looks identical
   // to a real edit, which would immediately re-save (and re-timestamp)
@@ -124,9 +130,71 @@ function Editor() {
   // local data on every single page load.
   const skipNextAutosaveRef = useRef(true);
 
+  // ---- Undo / redo ----
+  // Snapshots are taken at the START of a discrete action (drag begins,
+  // field gains focus, connection starts, block added/removed) rather
+  // than on every intermediate change — so dragging a block doesn't
+  // create dozens of undo steps, only one per drag gesture.
+  const HISTORY_LIMIT = 50;
+  const pastRef = useRef<{ placed: PlacedBlock[]; connections: Connection[] }[]>([]);
+  const futureRef = useRef<{ placed: PlacedBlock[]; connections: Connection[] }[]>([]);
+  const [historyTick, setHistoryTick] = useState(0); // bumped to force re-render for button disabled state
+  const canUndo = pastRef.current.length > 0;
+  const canRedo = futureRef.current.length > 0;
+
+  const commitHistory = useCallback((snapshot: { placed: PlacedBlock[]; connections: Connection[] }) => {
+    pastRef.current.push(snapshot);
+    if (pastRef.current.length > HISTORY_LIMIT) pastRef.current.shift();
+    futureRef.current = [];
+    setHistoryTick((t) => t + 1);
+  }, []);
+
+  const undo = useCallback(() => {
+    if (pastRef.current.length === 0) return;
+    const previous = pastRef.current.pop()!;
+    futureRef.current.push({ placed: placedRef.current, connections: connectionsRef.current });
+    setPlaced(previous.placed);
+    setConnections(previous.connections);
+    setHistoryTick((t) => t + 1);
+  }, []);
+
+  const redo = useCallback(() => {
+    if (futureRef.current.length === 0) return;
+    const next = futureRef.current.pop()!;
+    pastRef.current.push({ placed: placedRef.current, connections: connectionsRef.current });
+    setPlaced(next.placed);
+    setConnections(next.connections);
+    setHistoryTick((t) => t + 1);
+  }, []);
+
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      const target = e.target as HTMLElement | null;
+      const isEditableFocused =
+        target && (target.tagName === "INPUT" || target.tagName === "SELECT" || target.tagName === "TEXTAREA");
+      // Let native undo work inside text fields (e.g. name editing) —
+      // only intercept for canvas-level history otherwise.
+      if (isEditableFocused) return;
+
+      const mod = e.metaKey || e.ctrlKey;
+      if (!mod) return;
+      if (e.key.toLowerCase() === "z" && !e.shiftKey) {
+        e.preventDefault();
+        undo();
+      } else if ((e.key.toLowerCase() === "z" && e.shiftKey) || e.key.toLowerCase() === "y") {
+        e.preventDefault();
+        redo();
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [undo, redo]);
+
   useEffect(() => {
     let cancelled = false;
     skipNextAutosaveRef.current = true; // reset per project load — see autosave effect below
+    pastRef.current = [];
+    futureRef.current = [];
     (async () => {
       // Pull first: without this, a newer server copy (e.g. edited
       // directly in Postgres, or from another device) would never be
@@ -240,6 +308,7 @@ function Editor() {
     def.fields?.forEach((f) => {
       values[f.name] = f.default ?? "";
     });
+    commitHistory({ placed, connections });
     setPlaced((prev) => [
       ...prev,
       { instanceId: crypto.randomUUID(), defId: def.id, x: Math.max(16, x), y: Math.max(16, y), values },
@@ -257,6 +326,7 @@ function Editor() {
   }
 
   function removeBlock(id: string) {
+    commitHistory({ placed, connections });
     setPlaced((prev) => prev.filter((b) => b.instanceId !== id));
     setConnections((prev) => prev.filter((c) => c.from !== id && c.to !== id));
   }
@@ -282,6 +352,7 @@ function Editor() {
       if (target && target.blockId !== fromId) {
         const targetBlock = placedRef.current.find((b) => b.instanceId === target.blockId);
         const targetIsConnector = getBlockDef(targetBlock?.defId ?? "")?.category === "connector";
+        commitHistory({ placed: placedRef.current, connections: connectionsRef.current });
         setConnections((prev) => [
           ...prev.filter((c) => {
             const targetsSamePort = c.to === target.blockId && c.toPort === target.portId;
@@ -349,6 +420,25 @@ function Editor() {
         </div>
 
         <div className="flex items-center gap-2">
+          <button
+            onClick={undo}
+            disabled={!canUndo}
+            className="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:pointer-events-none disabled:opacity-35"
+            aria-label="Undo"
+            title="Undo (Ctrl+Z)"
+          >
+            <Undo2 className="h-4 w-4" />
+          </button>
+          <button
+            onClick={redo}
+            disabled={!canRedo}
+            className="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:pointer-events-none disabled:opacity-35"
+            aria-label="Redo"
+            title="Redo (Ctrl+Shift+Z)"
+          >
+            <Redo2 className="h-4 w-4" />
+          </button>
+          <div className="mr-1 h-5 w-px bg-border" />
           <Button onClick={handleRun} disabled={running} size="sm" className="h-9 rounded-lg px-3.5 shadow-soft">
             <Play className="mr-1.5 h-3.5 w-3.5" fill="currentColor" />
             {running ? "Running…" : "Run"}
@@ -491,6 +581,7 @@ function Editor() {
                 onStartConnect={(portId, x, y) => startConnect(b.instanceId, portId, x, y)}
                 onPortEnter={(portId) => (hoveredPortRef.current = { blockId: b.instanceId, portId })}
                 onPortLeave={() => (hoveredPortRef.current = null)}
+                onBeforeChange={() => commitHistory({ placed, connections })}
                 connecting={!!pending && pending.from !== b.instanceId}
               />
             ))}
@@ -670,6 +761,7 @@ function CanvasBlock({
   onStartConnect,
   onPortEnter,
   onPortLeave,
+  onBeforeChange,
   connecting,
 }: {
   block: PlacedBlock;
@@ -679,6 +771,9 @@ function CanvasBlock({
   onStartConnect: (portId: PortId, clientX: number, clientY: number) => void;
   onPortEnter: (portId: PortId) => void;
   onPortLeave: () => void;
+  /** Called once, right before a drag or field edit begins, to commit an
+   * undo/redo snapshot of the pre-change state. */
+  onBeforeChange: () => void;
   connecting: boolean;
 }) {
   const def = getBlockDef(block.defId);
@@ -704,6 +799,7 @@ function CanvasBlock({
             field={seg.field}
             value={block.values[seg.field.name] ?? ""}
             onChange={(v) => onFieldChange(seg.field.name, v)}
+            onFocus={onBeforeChange}
           />
         ),
       )}
@@ -714,6 +810,7 @@ function CanvasBlock({
 
   const startDrag = (e: React.MouseEvent) => {
     if ((e.target as HTMLElement).closest("[data-no-drag]")) return;
+    onBeforeChange();
     dragging.current = true;
     dragOffset.current = { x: e.clientX - block.x, y: e.clientY - block.y };
     const move = (ev: MouseEvent) => {
@@ -895,10 +992,12 @@ function InlineField({
   field,
   value,
   onChange,
+  onFocus,
 }: {
   field: BlockField;
   value: string;
   onChange: (v: string) => void;
+  onFocus?: () => void;
 }) {
   if (field.kind === "select") {
     return (
@@ -906,6 +1005,7 @@ function InlineField({
         data-no-drag
         value={value}
         onChange={(e) => onChange(e.target.value)}
+        onFocus={onFocus}
         onMouseDown={(e) => e.stopPropagation()}
         className="h-7 rounded-full border-0 bg-white/95 px-2 text-[12.5px] font-medium text-foreground shadow-soft outline-none focus:ring-2 focus:ring-white"
         style={{ width: field.width ?? 70 }}
@@ -925,6 +1025,7 @@ function InlineField({
       value={value}
       placeholder={field.placeholder}
       onChange={(e) => onChange(e.target.value)}
+      onFocus={onFocus}
       onMouseDown={(e) => e.stopPropagation()}
       className="h-7 rounded-full border-0 bg-white/95 px-2.5 text-[12.5px] font-medium text-foreground shadow-soft outline-none placeholder:text-muted-foreground focus:ring-2 focus:ring-white"
       style={{ width: field.width ?? 90 }}
