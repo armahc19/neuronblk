@@ -59,6 +59,13 @@ function Home() {
 
   useEffect(() => {
     void refresh();
+    // A background pull (from startSyncManager, e.g. on app load or
+    // reconnect) can update IndexedDB after this page's initial read —
+    // without this, a newer project fetched from the server wouldn't
+    // show up until a manual reload.
+    const onUpdated = () => void refresh();
+    window.addEventListener("neuronblk:projects-updated", onUpdated);
+    return () => window.removeEventListener("neuronblk:projects-updated", onUpdated);
   }, []);
 
   const filtered = projects.filter((p) =>

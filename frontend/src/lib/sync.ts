@@ -5,7 +5,7 @@ import {
   getProjectLocal,
   listProjectsLocal,
   markSynced,
-  saveProjectLocal,
+  saveProjectFromServer,
   type SyncQueueEntry,
 } from "./db";
 
@@ -77,7 +77,9 @@ async function syncOne(entry: SyncQueueEntry): Promise<void> {
 /** Pull server projects that are newer than the local copy — covers the
  * "edited on another device" case. Simple one-directional resolution by
  * timestamp; no merge UI needed since each project is single-writer in
- * practice. */
+ * practice. Dispatches "neuronblk:projects-updated" if anything actually
+ * changed, so mounted UI (e.g. the project list) knows to re-read from
+ * IndexedDB instead of showing whatever it already had in memory. */
 export async function pullFromServer(): Promise<void> {
   if (!navigator.onLine) return;
   try {
@@ -94,13 +96,20 @@ export async function pullFromServer(): Promise<void> {
     const local = await listProjectsLocal();
     const localById = new Map(local.map((p) => [p.id, p]));
 
+    let changed = false;
     for (const sp of serverProjects) {
       const l = localById.get(sp.id);
       const serverTime = new Date(sp.updated_at).getTime();
       if (!l || serverTime > l.updatedAt) {
-        await saveProjectLocal({ id: sp.id, name: sp.name, blocks: sp.blocks, connections: sp.connections });
-        await markSynced(sp.id, serverTime);
+        await saveProjectFromServer(
+          { id: sp.id, name: sp.name, blocks: sp.blocks, connections: sp.connections },
+          serverTime,
+        );
+        changed = true;
       }
+    }
+    if (changed) {
+      window.dispatchEvent(new CustomEvent("neuronblk:projects-updated"));
     }
   } catch {
     // Offline or backend unreachable — local-first means this is fine,

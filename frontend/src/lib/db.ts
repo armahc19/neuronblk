@@ -72,6 +72,20 @@ export async function saveProjectLocal(
   return record;
 }
 
+/** Writes data pulled from the server. Unlike saveProjectLocal, this does
+ * NOT mark the record dirty or enqueue a sync push — the data just came
+ * from the server, so pushing it right back would be a pointless
+ * round-trip (and, in a race, could shadow the fix in markSynced). */
+export async function saveProjectFromServer(
+  project: Pick<StoredProject, "id" | "name" | "blocks" | "connections">,
+  serverUpdatedAt: number,
+): Promise<StoredProject> {
+  const db = await openDB();
+  const record: StoredProject = { ...project, updatedAt: serverUpdatedAt, dirty: false };
+  await toPromise(store(db, PROJECTS_STORE, "readwrite").put(record));
+  return record;
+}
+
 export async function getProjectLocal(id: string): Promise<StoredProject | undefined> {
   const db = await openDB();
   return toPromise(store(db, PROJECTS_STORE, "readonly").get(id));
