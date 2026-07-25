@@ -22,6 +22,7 @@ import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
 import { BLOCK_CATEGORIES, getBlockDef, type BlockDef, type BlockField } from "@/lib/blocks";
 import { projectStore, type Project } from "@/lib/projectStore";
+import { pullFromServer } from "@/lib/sync";
 import { cn } from "@/lib/utils";
 
 export const Route = createFileRoute("/editor/$projectId")({
@@ -116,10 +117,22 @@ function Editor() {
   useEffect(() => {
     placedRef.current = placed;
   }, [placed]);
+  // Guards the autosave effect below against firing on the initial load
+  // itself — without this, hydrating state from storage looks identical
+  // to a real edit, which would immediately re-save (and re-timestamp)
+  // whatever was just read, clobbering any newer server data with stale
+  // local data on every single page load.
+  const skipNextAutosaveRef = useRef(true);
 
   useEffect(() => {
     let cancelled = false;
+    skipNextAutosaveRef.current = true; // reset per project load — see autosave effect below
     (async () => {
+      // Pull first: without this, a newer server copy (e.g. edited
+      // directly in Postgres, or from another device) would never be
+      // seen — the editor would just hydrate from whatever's already in
+      // local IndexedDB, which could be stale.
+      await pullFromServer();
       const p = await projectStore.get(projectId);
       if (cancelled) return;
       if (!p) {
@@ -171,10 +184,15 @@ function Editor() {
 
   // Debounced autosave: persist canvas edits ~800ms after the user stops
   // dragging/typing, so work survives a refresh without needing a manual
-  // Save click. Skipped until the project has finished its initial load
-  // (project === null) to avoid immediately re-saving what was just read.
+  // Save click. The skipNextAutosaveRef guard (reset per project load,
+  // above) prevents this from firing on the initial hydration itself —
+  // only genuine subsequent edits trigger a save.
   useEffect(() => {
     if (!project) return;
+    if (skipNextAutosaveRef.current) {
+      skipNextAutosaveRef.current = false;
+      return;
+    }
     const timer = setTimeout(() => {
       void projectStore.saveState(project.id, project.name, placed, connections);
     }, 800);
