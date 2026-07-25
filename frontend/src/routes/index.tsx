@@ -23,7 +23,7 @@ import {
   DialogDescription,
 } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
-import { projectStore, type Project } from "@/lib/projects";
+import { projectStore, type Project } from "@/lib/projectStore";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -51,26 +51,37 @@ function Home() {
   const [query, setQuery] = useState("");
   const [modalOpen, setModalOpen] = useState(false);
   const [name, setName] = useState("");
+  const [creating, setCreating] = useState(false);
+
+  async function refresh() {
+    setProjects(await projectStore.list());
+  }
 
   useEffect(() => {
-    setProjects(projectStore.list());
+    void refresh();
   }, []);
 
   const filtered = projects.filter((p) =>
     p.name.toLowerCase().includes(query.toLowerCase()),
   );
 
-  function handleCreate(e: React.FormEvent) {
+  async function handleCreate(e: React.FormEvent) {
     e.preventDefault();
-    const project = projectStore.create(name || "Untitled Project");
-    setModalOpen(false);
-    setName("");
-    navigate({ to: "/editor/$projectId", params: { projectId: project.id } });
+    if (creating) return; // guard against double-submit while awaiting
+    setCreating(true);
+    try {
+      const project = await projectStore.create(name || "Untitled Project");
+      setModalOpen(false);
+      setName("");
+      navigate({ to: "/editor/$projectId", params: { projectId: project.id } });
+    } finally {
+      setCreating(false);
+    }
   }
 
-  function handleDelete(id: string) {
-    projectStore.remove(id);
-    setProjects(projectStore.list());
+  async function handleDelete(id: string) {
+    await projectStore.remove(id);
+    await refresh();
   }
 
   return (
@@ -176,7 +187,9 @@ function Home() {
               <Button type="button" variant="ghost" onClick={() => setModalOpen(false)}>
                 Cancel
               </Button>
-              <Button type="submit" className="rounded-xl">Create</Button>
+              <Button type="submit" className="rounded-xl" disabled={creating}>
+                {creating ? "Creating…" : "Create"}
+              </Button>
             </DialogFooter>
           </form>
         </DialogContent>

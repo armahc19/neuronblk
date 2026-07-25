@@ -12,6 +12,8 @@ import { useEffect, type ReactNode } from "react";
 import appCss from "../styles.css?url";
 import { reportLovableError } from "../lib/lovable-error-reporting";
 
+import { startSyncManager } from "@/lib/sync";
+
 function NotFoundComponent() {
   return (
     <div className="flex min-h-screen items-center justify-center bg-background px-4">
@@ -125,6 +127,10 @@ function RootShell({ children }: { children: ReactNode }) {
 
 function RootComponent() {
   const { queryClient } = Route.useRouteContext();
+  useEffect(() => {
+    const stop = startSyncManager();
+    return stop; // cleanup on unmount — harmless since it's idempotent anyway
+  }, []);
 
   return (
     <QueryClientProvider client={queryClient}>

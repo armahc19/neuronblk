@@ -21,7 +21,7 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
 import { BLOCK_CATEGORIES, getBlockDef, type BlockDef, type BlockField } from "@/lib/blocks";
-import { projectStore, type Project } from "@/lib/projects";
+import { projectStore, type Project } from "@/lib/projectStore";
 import { cn } from "@/lib/utils";
 
 export const Route = createFileRoute("/editor/$projectId")({
@@ -118,13 +118,22 @@ function Editor() {
   }, [placed]);
 
   useEffect(() => {
-    const p = projectStore.get(projectId);
-    if (!p) {
-      navigate({ to: "/" });
-      return;
-    }
-    setProject(p);
-    setNameDraft(p.name);
+    let cancelled = false;
+    (async () => {
+      const p = await projectStore.get(projectId);
+      if (cancelled) return;
+      if (!p) {
+        navigate({ to: "/" });
+        return;
+      }
+      setProject(p);
+      setNameDraft(p.name);
+      setPlaced((p.blocks as PlacedBlock[] | undefined) ?? []);
+      setConnections((p.connections as Connection[] | undefined) ?? []);
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [projectId, navigate]);
 
   const filteredCategories = useMemo(() => {
@@ -146,19 +155,31 @@ function Editor() {
     [project?.name, placed, connections],
   );
 
-  function commitName() {
+  async function commitName() {
     setEditingName(false);
     if (!project) return;
     const name = nameDraft.trim() || project.name;
-    projectStore.rename(project.id, name);
+    await projectStore.rename(project.id, name);
     setProject({ ...project, name });
   }
 
-  function handleSave() {
+  async function handleSave() {
     if (!project) return;
-    projectStore.rename(project.id, project.name);
-    toast.success("Project saved", { description: "All changes are stored locally." });
+    await projectStore.saveState(project.id, project.name, placed, connections);
+    toast.success("Project saved", { description: "Stored locally and queued to sync." });
   }
+
+  // Debounced autosave: persist canvas edits ~800ms after the user stops
+  // dragging/typing, so work survives a refresh without needing a manual
+  // Save click. Skipped until the project has finished its initial load
+  // (project === null) to avoid immediately re-saving what was just read.
+  useEffect(() => {
+    if (!project) return;
+    const timer = setTimeout(() => {
+      void projectStore.saveState(project.id, project.name, placed, connections);
+    }, 800);
+    return () => clearTimeout(timer);
+  }, [project, placed, connections]);
 
   function handleRun() {
     setRunning(true);

@@ -1,3 +1,4 @@
+import os
 import uuid
 from contextlib import asynccontextmanager
 
@@ -19,10 +20,18 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="NeuronBLK Sync API", lifespan=lifespan)
 
-# Adjust to match your Vite/dev server origin.
+# CORS_ORIGINS env var: comma-separated list of allowed origins, e.g.
+#   CORS_ORIGINS=http://localhost:5173,https://your-preview-domain.example
+# If unset, falls back to "*" (allow any origin). That's safe here since
+# this API doesn't use cookies/credentials — nothing sensitive to steal
+# via CSRF — but lock it down to real origins once you deploy anywhere
+# that matters.
+_origins_env = os.getenv("CORS_ORIGINS", "*")
+allow_origins = ["*"] if _origins_env == "*" else [o.strip() for o in _origins_env.split(",")]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=allow_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -90,3 +99,4 @@ async def delete_project(project_id: uuid.UUID, session: AsyncSession = Depends(
         await session.delete(project)
         await session.commit()
     return None
+
