@@ -19,6 +19,7 @@ import {
   ZoomOut,
   Maximize,
   RotateCcw,
+  AlertTriangle,
   X,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -446,6 +447,7 @@ function Editor() {
   }, [query]);
 
   const orderedBlocks = useMemo(() => orderByConnections(placed, connections), [placed, connections]);
+  const validation = useMemo(() => computeValidation(placed, connections), [placed, connections]);
   const generatedPython = useMemo(
     () => generatePython(project?.name, placed, connections),
     [project?.name, placed, connections],
@@ -792,6 +794,8 @@ function Editor() {
                   onSelect={(shiftKey) => handleSelectBlock(b.instanceId, shiftKey)}
                   panModeActive={spaceDown}
                   screenToWorld={screenToWorld}
+                  issues={validation.blockIssues.get(b.instanceId) ?? []}
+                  unreachable={validation.unreachableIds.has(b.instanceId)}
                   onRemove={() => removeBlocks(new Set([b.instanceId]))}
                   onMove={(x, y) => updateBlock(b.instanceId, { x, y })}
                   onFieldChange={(field, value) => updateValue(b.instanceId, field, value)}
@@ -809,6 +813,25 @@ function Editor() {
                 <p className="text-sm text-muted-foreground">
                   Drag a block here to get started
                 </p>
+              </div>
+            )}
+
+            {/* Program-level validation messages — small banner, not a dialog */}
+            {validation.globalMessages.length > 0 && (
+              <div className="absolute left-4 top-4 z-30 flex flex-col gap-1.5">
+                {validation.globalMessages.map((m, i) => (
+                  <div
+                    key={i}
+                    className={cn(
+                      "rounded-lg border px-3 py-1.5 text-xs font-medium shadow-soft backdrop-blur",
+                      m.severity === "error"
+                        ? "border-red-300 bg-red-50 text-red-700"
+                        : "border-amber-300 bg-amber-50 text-amber-700",
+                    )}
+                  >
+                    {m.severity === "error" ? "❌" : "⚠️"} {m.message}
+                  </div>
+                ))}
               </div>
             )}
 
@@ -1024,6 +1047,8 @@ function CanvasBlock({
   onSelect,
   panModeActive,
   screenToWorld,
+  issues,
+  unreachable,
   connecting,
 }: {
   block: PlacedBlock;
@@ -1042,6 +1067,12 @@ function CanvasBlock({
    * moving this block. */
   panModeActive: boolean;
   screenToWorld: (clientX: number, clientY: number) => { x: number; y: number };
+  /** Validation problems specific to this block — rendered as a small
+   * red badge with the messages in its hover tooltip. */
+  issues: ValidationIssue[];
+  /** True if this block exists but is never reached from any Start
+   * block — dead code, shown dimmed with a dashed outline. */
+  unreachable: boolean;
   connecting: boolean;
 }) {
   const def = getBlockDef(block.defId);
@@ -1158,6 +1189,9 @@ function CanvasBlock({
   }
 
   const showOut = category !== "conditions" && block.defId !== "start.stop";
+  const hasError = issues.some((i) => i.severity === "error");
+  const outlineColor = selected ? "var(--color-primary)" : hasError ? "#ef4444" : unreachable ? "var(--color-border)" : "transparent";
+  const outlineStyleKind = selected || hasError ? "solid" : "dashed";
 
   return (
     <div
@@ -1167,12 +1201,21 @@ function CanvasBlock({
         left: block.x,
         top: block.y,
         width: BLOCK_W,
-        outline: selected ? "2px solid var(--color-primary)" : "none",
+        outline: outlineColor === "transparent" ? "none" : `2px ${outlineStyleKind} ${outlineColor}`,
         outlineOffset: 4,
         borderRadius: 12,
+        opacity: unreachable ? 0.55 : 1,
       }}
       onMouseDown={startDrag}
     >
+      {issues.length > 0 && (
+        <div
+          className="absolute -left-1.5 -top-1.5 z-30 flex h-4 w-4 items-center justify-center rounded-full bg-red-500 text-[9px] font-bold text-white shadow-sm"
+          title={issues.map((i) => i.message).join("\n")}
+        >
+          !
+        </div>
+      )}
       {/* Input port (top) — every block */}
       <div
         data-no-drag
@@ -1353,6 +1396,161 @@ function elbowPath(a: { x: number; y: number }, b: { x: number; y: number }) {
   const dropY = a.y + 28;
   const sideX = Math.min(a.x, b.x) - 40;
   return `M ${a.x} ${a.y} L ${a.x} ${dropY} L ${sideX} ${dropY} L ${sideX} ${b.y} L ${b.x} ${b.y}`;
+}
+
+/**
+ * Validation rules for beginner-friendly structural checks — surfaced as
+ * per-block markers and a small non-blocking banner, not a popup dialog.
+ */
+type ValidationIssue = { severity: "error" | "warning"; message: string };
+
+type ValidationResult = {
+  /** Per-block problems — rendered as a small red badge + hover tooltip
+   * on the specific block, per the "highlight, don't dialog" approach. */
+  blockIssues: Map<string, ValidationIssue[]>;
+  /** Blocks that exist and may even be internally well-formed, but are
+   * never reached from any Start block — dead code. */
+  unreachableIds: Set<string>;
+  /** Problems that can't be pinned to one block (e.g. "no Start block at
+   * all") — shown as a small banner instead of a per-block marker. */
+  globalMessages: ValidationIssue[];
+};
+
+function computeValidation(blocks: PlacedBlock[], connections: Connection[]): ValidationResult {
+  const blockIssues = new Map<string, ValidationIssue[]>();
+  const globalMessages: ValidationIssue[] = [];
+
+  function addIssue(id: string, issue: ValidationIssue) {
+    const list = blockIssues.get(id) ?? [];
+    list.push(issue);
+    blockIssues.set(id, list);
+  }
+
+  if (blocks.length === 0) {
+    return { blockIssues, unreachableIds: new Set(), globalMessages };
+  }
+
+  // Rule: exactly one Start block.
+  const startBlocks = blocks.filter((b) => b.defId === "start.main");
+  if (startBlocks.length === 0) {
+    globalMessages.push({ severity: "warning", message: "No Start block — add one to define where the program begins." });
+  } else if (startBlocks.length > 1) {
+    globalMessages.push({ severity: "error", message: `${startBlocks.length} Start blocks found — only one is allowed.` });
+    startBlocks.forEach((b) => addIssue(b.instanceId, { severity: "error", message: "Only one Start block is allowed." }));
+  }
+
+  // Rule: at least one End block.
+  const endBlocks = blocks.filter((b) => b.defId === "start.stop");
+  if (endBlocks.length === 0) {
+    globalMessages.push({ severity: "warning", message: "Program has no End block." });
+  }
+
+  // Rule: every non-Start block should have something feeding into it;
+  // a Start block should lead somewhere. Covers both fully isolated
+  // blocks and blocks that only look connected because they have an
+  // outgoing wire but nothing upstream ever reaches them.
+  const hasIncoming = new Set<string>();
+  const outgoingPortsByBlock = new Map<string, Set<PortId>>();
+  for (const c of connections) {
+    hasIncoming.add(c.to);
+    if (!outgoingPortsByBlock.has(c.from)) outgoingPortsByBlock.set(c.from, new Set());
+    outgoingPortsByBlock.get(c.from)!.add(c.fromPort);
+  }
+
+  for (const b of blocks) {
+    const def = getBlockDef(b.defId);
+    if (!def) continue;
+    const isStart = b.defId === "start.main";
+    const outs = outgoingPortsByBlock.get(b.instanceId) ?? new Set<PortId>();
+
+    if (isStart) {
+      if (outs.size === 0) {
+        addIssue(b.instanceId, { severity: "warning", message: "Start block isn't connected to anything." });
+      }
+    } else if (!hasIncoming.has(b.instanceId)) {
+      addIssue(b.instanceId, { severity: "error", message: "Not connected — nothing leads into this block." });
+    }
+
+    // Rule: decision (diamond) blocks need both Yes and No wired.
+    if (def.category === "conditions") {
+      const hasTrue = outs.has("true");
+      const hasFalse = outs.has("false");
+      if (!hasTrue && !hasFalse) {
+        addIssue(b.instanceId, { severity: "error", message: 'Decision block needs both "Yes" and "No" connections.' });
+      } else if (!hasTrue) {
+        addIssue(b.instanceId, { severity: "error", message: 'Missing "Yes" (True) connection.' });
+      } else if (!hasFalse) {
+        addIssue(b.instanceId, { severity: "error", message: 'Missing "No" (False) connection.' });
+      }
+    }
+  }
+
+  // Rule: unreachable blocks — dead code that exists and may even wire
+  // together fine internally, but is never reached from any Start block.
+  const forwardAdjacency = new Map<string, string[]>();
+  for (const c of connections) {
+    if (!forwardAdjacency.has(c.from)) forwardAdjacency.set(c.from, []);
+    forwardAdjacency.get(c.from)!.push(c.to);
+  }
+  const reachable = new Set<string>();
+  const queue = startBlocks.map((b) => b.instanceId);
+  while (queue.length > 0) {
+    const id = queue.shift()!;
+    if (reachable.has(id)) continue;
+    reachable.add(id);
+    for (const next of forwardAdjacency.get(id) ?? []) {
+      if (!reachable.has(next)) queue.push(next);
+    }
+  }
+  const unreachableIds = new Set<string>();
+  if (startBlocks.length > 0) {
+    for (const b of blocks) {
+      if (!reachable.has(b.instanceId)) unreachableIds.add(b.instanceId);
+    }
+  }
+
+  // Rule: infinite cycles — a cycle in the flow that does NOT go through
+  // a loop block's dedicated "loopback" port (the one sanctioned way to
+  // intentionally repeat) is almost certainly an accidental miswiring.
+  const cycleAdjacency = new Map<string, string[]>();
+  for (const c of connections) {
+    if (c.toPort === "loopback") continue; // legitimate repeat edge, not a bug
+    if (!cycleAdjacency.has(c.from)) cycleAdjacency.set(c.from, []);
+    cycleAdjacency.get(c.from)!.push(c.to);
+  }
+  const WHITE = 0;
+  const GRAY = 1;
+  const BLACK = 2;
+  const color = new Map<string, number>();
+  blocks.forEach((b) => color.set(b.instanceId, WHITE));
+  const inCycle = new Set<string>();
+  const stack: string[] = [];
+
+  function dfs(id: string) {
+    color.set(id, GRAY);
+    stack.push(id);
+    for (const next of cycleAdjacency.get(id) ?? []) {
+      if (color.get(next) === GRAY) {
+        const idx = stack.indexOf(next);
+        for (let i = idx; i < stack.length; i++) inCycle.add(stack[i]);
+      } else if (color.get(next) === WHITE) {
+        dfs(next);
+      }
+    }
+    stack.pop();
+    color.set(id, BLACK);
+  }
+  for (const b of blocks) {
+    if (color.get(b.instanceId) === WHITE) dfs(b.instanceId);
+  }
+  for (const id of inCycle) {
+    addIssue(id, {
+      severity: "error",
+      message: "Infinite loop detected — this cycle doesn't go through a Loop block's repeat connection.",
+    });
+  }
+
+  return { blockIssues, unreachableIds, globalMessages };
 }
 
 /**
