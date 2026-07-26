@@ -32,6 +32,7 @@ import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
 import { BLOCK_CATEGORIES, getBlockDef, type BlockDef, type BlockField } from "@/lib/blocks";
 import { projectStore, type Project } from "@/lib/projectStore";
+import { functionStore, type SavedFunction } from "@/lib/functionStore";
 import { pullFromServer } from "@/lib/sync";
 import { cn } from "@/lib/utils";
 
@@ -110,6 +111,7 @@ function Editor() {
   const { projectId } = Route.useParams();
   const navigate = useNavigate();
   const [project, setProject] = useState<Project | null>(null);
+  const [functions, setFunctions] = useState<SavedFunction[]>([]);
   const [nameDraft, setNameDraft] = useState("");
   const [editingName, setEditingName] = useState(false);
   const [query, setQuery] = useState("");
@@ -418,7 +420,8 @@ function Editor() {
       // Pull first: without this, a newer server copy (e.g. edited
       // directly in Postgres, or from another device) would never be
       // seen — the editor would just hydrate from whatever's already in
-      // local IndexedDB, which could be stale.
+      // local IndexedDB, which could be stale. This also pulls functions
+      // (pullFromServer covers both kinds), so the list below is fresh.
       await pullFromServer();
       const p = await projectStore.get(projectId);
       if (cancelled) return;
@@ -430,30 +433,39 @@ function Editor() {
       setNameDraft(p.name);
       setPlaced((p.blocks as PlacedBlock[] | undefined) ?? []);
       setConnections((p.connections as Connection[] | undefined) ?? []);
+      setFunctions(await functionStore.list());
     })();
     return () => {
       cancelled = true;
     };
   }, [projectId, navigate]);
 
+  useEffect(() => {
+    const onFunctionsUpdated = () => void functionStore.list().then(setFunctions);
+    window.addEventListener("neuronblk:functions-updated", onFunctionsUpdated);
+    return () => window.removeEventListener("neuronblk:functions-updated", onFunctionsUpdated);
+  }, []);
+
   const filteredCategories = useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (!q) return BLOCK_CATEGORIES;
     return BLOCK_CATEGORIES.map((c) => ({
       ...c,
-      blocks: c.blocks.filter(
-        (b) =>
-          b.label.toLowerCase().includes(q) ||
-          b.description.toLowerCase().includes(q),
-      ),
+      blocks: c.blocks.filter((b) => {
+        if (b.contexts && !b.contexts.includes("project")) return false;
+        if (!q) return true;
+        return b.label.toLowerCase().includes(q) || b.description.toLowerCase().includes(q);
+      }),
     })).filter((c) => c.blocks.length > 0);
   }, [query]);
 
   const orderedBlocks = useMemo(() => orderByConnections(placed, connections), [placed, connections]);
-  const validation = useMemo(() => computeValidation(placed, connections), [placed, connections]);
+  const validation = useMemo(
+    () => computeValidation(placed, connections, new Set(functions.map((f) => f.id))),
+    [placed, connections, functions],
+  );
   const generatedPython = useMemo(
-    () => generatePython(project?.name, placed, connections),
-    [project?.name, placed, connections],
+    () => generatePython(project?.name, placed, connections, functions),
+    [project?.name, placed, connections, functions],
   );
 
   async function commitName() {
@@ -933,6 +945,7 @@ function Editor() {
                   screenToWorld={screenToWorld}
                   issues={validation.blockIssues.get(b.instanceId) ?? []}
                   unreachable={validation.unreachableIds.has(b.instanceId)}
+                  functions={functions}
                   onRemove={() => removeBlocks(new Set([b.instanceId]))}
                   onMove={(x, y) => updateBlock(b.instanceId, { x, y })}
                   onFieldChange={(field, value) => updateValue(b.instanceId, field, value)}
@@ -1187,6 +1200,7 @@ function CanvasBlock({
   screenToWorld,
   issues,
   unreachable,
+  functions,
   connecting,
 }: {
   block: PlacedBlock;
@@ -1211,6 +1225,9 @@ function CanvasBlock({
   /** True if this block exists but is never reached from any Start
    * block — dead code, shown dimmed with a dashed outline. */
   unreachable: boolean;
+  /** The saved-function library, needed only by fn.call's dynamic
+   * picker — every other block ignores this. */
+  functions: SavedFunction[];
   connecting: boolean;
 }) {
   const def = getBlockDef(block.defId);
@@ -1220,10 +1237,13 @@ function CanvasBlock({
   if (!def) return null;
 
   const category = def.category;
+  const isFnCall = block.defId === "fn.call";
   const segments = renderTemplate(def.template ?? def.label, def.fields ?? []);
   const hasFields = segments.length > 0 && def.fields && def.fields.length > 0;
 
-  const fieldsContent = hasFields ? (
+  const fieldsContent = isFnCall ? (
+    <FnCallFields block={block} functions={functions} onFieldChange={onFieldChange} onFocus={onBeforeChange} />
+  ) : hasFields ? (
     <div className="flex flex-wrap items-center justify-center gap-1.5">
       {segments.map((seg, i) =>
         seg.type === "text" ? (
@@ -1495,6 +1515,62 @@ function InlineField({
   );
 }
 
+/**
+ * Custom renderer for fn.call blocks: a dropdown to pick which saved
+ * function to invoke, followed by one inline input per parameter that
+ * specific function declares — reshaping live as the selection changes.
+ * The selected function's id lives in block.values.__functionId; each
+ * parameter's value lives under its own name, same as any other field.
+ */
+function FnCallFields({
+  block,
+  functions,
+  onFieldChange,
+  onFocus,
+}: {
+  block: PlacedBlock;
+  functions: SavedFunction[];
+  onFieldChange: (field: string, value: string) => void;
+  onFocus?: () => void;
+}) {
+  const selectedId = block.values.__functionId ?? "";
+  const selected = functions.find((f) => f.id === selectedId);
+
+  return (
+    <div className="flex flex-wrap items-center justify-center gap-1.5">
+      <select
+        data-no-drag
+        value={selectedId}
+        onChange={(e) => onFieldChange("__functionId", e.target.value)}
+        onFocus={onFocus}
+        onMouseDown={(e) => e.stopPropagation()}
+        className="h-7 rounded-full border-0 bg-white/95 px-2 text-[12.5px] font-medium text-foreground shadow-soft outline-none focus:ring-2 focus:ring-white"
+        style={{ maxWidth: 140 }}
+      >
+        <option value="">Select function…</option>
+        {functions.map((f) => (
+          <option key={f.id} value={f.id}>
+            {f.name}
+          </option>
+        ))}
+      </select>
+      {selected?.params.map((p) => (
+        <input
+          key={p.name}
+          data-no-drag
+          value={block.values[p.name] ?? p.default ?? ""}
+          placeholder={p.name}
+          onChange={(e) => onFieldChange(p.name, e.target.value)}
+          onFocus={onFocus}
+          onMouseDown={(e) => e.stopPropagation()}
+          className="h-7 rounded-full border-0 bg-white/95 px-2.5 text-[12.5px] font-medium text-foreground shadow-soft outline-none placeholder:text-muted-foreground focus:ring-2 focus:ring-white"
+          style={{ width: 80 }}
+        />
+      ))}
+    </div>
+  );
+}
+
 type Seg = { type: "text"; value: string } | { type: "field"; field: BlockField };
 
 function renderTemplate(template: string, fields: BlockField[]): Seg[] {
@@ -1554,7 +1630,11 @@ type ValidationResult = {
   globalMessages: ValidationIssue[];
 };
 
-function computeValidation(blocks: PlacedBlock[], connections: Connection[]): ValidationResult {
+function computeValidation(
+  blocks: PlacedBlock[],
+  connections: Connection[],
+  functionIds: Set<string> = new Set(),
+): ValidationResult {
   const blockIssues = new Map<string, ValidationIssue[]>();
   const globalMessages: ValidationIssue[] = [];
 
@@ -1626,6 +1706,18 @@ function computeValidation(blocks: PlacedBlock[], connections: Connection[]): Va
     // port) — otherwise there's nothing to actually repeat.
     if (def.category === "loops" && outs.size === 0) {
       addIssue(b.instanceId, { severity: "warning", message: "Loop has no body connected." });
+    }
+
+    // Rule: fn.call must reference a function that still exists — the
+    // library entry could be missing entirely (nothing picked yet) or
+    // have been deleted since this call was placed.
+    if (b.defId === "fn.call") {
+      const fid = b.values.__functionId;
+      if (!fid) {
+        addIssue(b.instanceId, { severity: "error", message: "No function selected for this call." });
+      } else if (!functionIds.has(fid)) {
+        addIssue(b.instanceId, { severity: "error", message: "The function this call refers to no longer exists." });
+      }
     }
   }
 
@@ -1820,11 +1912,17 @@ function BottomPanel({
 }
 
 /** One Python line (or multi-line string) for a single block, at the given indent. */
-function emitLine(b: PlacedBlock, indent: string): string {
+function emitLine(
+  b: PlacedBlock,
+  indent: string,
+  functionsById: Map<string, SavedFunction>,
+  identifierById: Map<string, string>,
+): string {
   const v = b.values;
   switch (b.defId) {
     case "start.main":
-      return `${indent}# Program entry`;
+    case "fn.start":
+      return `${indent}# Entry point`;
     case "start.stop":
       return `${indent}return`;
     case "out.print":
@@ -1846,10 +1944,14 @@ function emitLine(b: PlacedBlock, indent: string): string {
     }
     case "if.compare":
       return `${indent}_ = (${v.a || "a"} ${v.op || "=="} ${v.b || "b"})`;
-    case "fn.define":
-      return `${indent}def ${v.name || "my_func"}(${v.args || ""}):\n${indent}    pass`;
-    case "fn.call":
-      return `${indent}${v.name || "my_func"}(${v.args || ""})`;
+    case "fn.call": {
+      const fid: string | undefined = v.__functionId;
+      const fn = fid ? functionsById.get(fid) : undefined;
+      if (!fn) return `${indent}# Call function: none selected`;
+      const identifier = (fid && identifierById.get(fid)) ?? pythonIdentifier(fn.name);
+      const args = fn.params.map((p) => v[p.name] || p.default || "None").join(", ");
+      return `${indent}${identifier}(${args})`;
+    }
     case "file.read":
       return `${indent}${v.var || "data"} = open(${py(v.path)}).read()`;
     case "file.write":
@@ -1875,12 +1977,27 @@ function emitLine(b: PlacedBlock, indent: string): string {
   }
 }
 
+/** Sanitizes a user-provided display name into a valid-ish Python
+ * identifier for def/call sites — names come from free text in the
+ * Function Editor and can contain spaces, punctuation, etc. */
+function pythonIdentifier(name: string): string {
+  const cleaned = (name || "function")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, "_")
+    .replace(/^([0-9])/, "_$1")
+    .replace(/^_+|_+$/g, "");
+  return cleaned || "function";
+}
+
 /**
  * Walks the actual connection graph to produce properly nested Python:
  * - if.then follows its "true" port for the if-body and "false" port for
  *   the else-body, indented one level deeper.
  * - loop.for/loop.while follow their "out" port for the loop body,
  *   indented one level deeper.
+ * - fn.return ends that path with a `return` line and never continues,
+ *   the same way start.stop does for the main program.
  * - A block's "out" connection normally continues the chain at the same
  *   indent — except when it targets a loop's "loopback" port, which marks
  *   "repeat" rather than "continue on", so the chain stops there instead
@@ -1889,29 +2006,26 @@ function emitLine(b: PlacedBlock, indent: string): string {
  *   from any branch stops that branch there instead of inlining further
  *   code. Whichever if/else or loop produced that branch then continues
  *   the OUTER chain — at its own original indent — from the connector's
- *   "out" port. This is how branches "rejoin": in real structured code,
- *   code after an if/else naturally runs regardless of which branch was
- *   taken, so the merge only needs to be generated once, not duplicated
- *   per branch. Connectors are reachable from multiple incoming
- *   connections (a real merge point), and are exempt from the normal
- *   one-visit dedup so every branch that reaches the same connector
- *   correctly reports it.
+ *   "out" port.
+ *
+ * This is shared by both the main program body and every saved
+ * function's body — a function's body is just another set of
+ * blocks/connections with its own root(s).
  */
 type ChainResult = { lines: string[]; mergeConnectorId?: string };
 
-function generatePython(projectName: string | undefined, blocks: PlacedBlock[], connections: Connection[]) {
-  const header = `# ${projectName ?? "Untitled"} — generated by NeuronBLK\n\ndef main():\n`;
-  if (blocks.length === 0) {
-    return header + "    # Drag blocks onto the canvas to generate code.\n    pass\n\nif __name__ == \"__main__\":\n    main()\n";
-  }
+function generateBody(
+  blocks: PlacedBlock[],
+  connections: Connection[],
+  functionsById: Map<string, SavedFunction>,
+  identifierById: Map<string, string>,
+  rootIds: string[],
+): string {
+  if (blocks.length === 0) return "    pass";
 
   const byId = new Map(blocks.map((b) => [b.instanceId, b]));
   const outByPort = new Map<string, Connection>();
-  const hasIncomingIn = new Set<string>();
-  for (const c of connections) {
-    outByPort.set(`${c.from}:${c.fromPort}`, c);
-    if (c.toPort === "in") hasIncomingIn.add(c.to);
-  }
+  for (const c of connections) outByPort.set(`${c.from}:${c.fromPort}`, c);
 
   const visited = new Set<string>();
 
@@ -1928,8 +2042,6 @@ function generatePython(projectName: string | undefined, blocks: PlacedBlock[], 
     const def = getBlockDef(block.defId);
     if (!def) return { lines: [] };
 
-    // Connectors never emit code themselves and can be reached from
-    // multiple branches, so they bypass the normal visited-dedup.
     if (def.category === "connector") {
       return { lines: [], mergeConnectorId: blockId };
     }
@@ -1973,7 +2085,11 @@ function generatePython(projectName: string | undefined, blocks: PlacedBlock[], 
       return { lines, mergeConnectorId: after.mergeConnectorId };
     }
 
-    const lines = [emitLine(block, indent)];
+    if (block.defId === "fn.return") {
+      return { lines: [`${indent}return ${v.value || "None"}`] };
+    }
+
+    const lines = [emitLine(block, indent, functionsById, identifierById)];
     const next = outByPort.get(`${blockId}:out`);
     // A connection into a loop's "loopback" port marks "repeat", not
     // "continue on" — stop the chain here instead of recursing into it.
@@ -1985,9 +2101,6 @@ function generatePython(projectName: string | undefined, blocks: PlacedBlock[], 
     return { lines };
   }
 
-  const roots = blocks.filter((b) => !hasIncomingIn.has(b.instanceId));
-  roots.sort((a, b) => a.y - b.y || a.x - b.x);
-
   const bodyLines: string[] = [];
   const runChainToEnd = (startId: string) => {
     let result = genChain(startId, "    ");
@@ -1997,9 +2110,7 @@ function generatePython(projectName: string | undefined, blocks: PlacedBlock[], 
       bodyLines.push(...result.lines);
     }
   };
-  for (const r of roots) {
-    runChainToEnd(r.instanceId);
-  }
+  for (const r of rootIds) runChainToEnd(r);
   // Anything never reached (disconnected islands) is still emitted so
   // nothing dropped on the canvas silently disappears from the code.
   for (const b of blocks) {
@@ -2008,8 +2119,97 @@ function generatePython(projectName: string | undefined, blocks: PlacedBlock[], 
     }
   }
 
-  const body = bodyLines.length ? bodyLines.join("\n") : "    pass";
-  return header + body + '\n\nif __name__ == "__main__":\n    main()\n';
+  return bodyLines.length ? bodyLines.join("\n") : "    pass";
+}
+
+/** Root blocks for a body with no explicit dedicated entry block: those
+ * with nothing feeding their "in" port. Used for the main program (whose
+ * roots are just "whatever has no incoming connection") — a function
+ * body instead roots specifically from its fn.start block(s). */
+function computeDefaultRoots(blocks: PlacedBlock[], connections: Connection[]): string[] {
+  const hasIncomingIn = new Set<string>();
+  for (const c of connections) if (c.toPort === "in") hasIncomingIn.add(c.to);
+  return blocks
+    .filter((b) => !hasIncomingIn.has(b.instanceId))
+    .sort((a, b) => a.y - b.y || a.x - b.x)
+    .map((b) => b.instanceId);
+}
+
+/** Walks every fn.call in `blocks`, and recursively into each called
+ * function's own body (nested reuse), collecting every function id
+ * transitively used. The `collected` guard means self-recursion and
+ * mutual recursion between functions terminate safely instead of
+ * looping forever — once a function's id is collected, its body is
+ * scanned exactly once. */
+function collectCalledFunctionIds(
+  blocks: PlacedBlock[],
+  functionsById: Map<string, SavedFunction>,
+  collected: Set<string>,
+  depth = 0,
+) {
+  if (depth > 50) return; // defensive cap against pathological/malformed data
+  for (const b of blocks) {
+    if (b.defId !== "fn.call") continue;
+    const fid: string | undefined = b.values.__functionId;
+    if (!fid || collected.has(fid) || !functionsById.has(fid)) continue;
+    collected.add(fid);
+    const fn = functionsById.get(fid)!;
+    collectCalledFunctionIds((fn.blocks as PlacedBlock[]) ?? [], functionsById, collected, depth + 1);
+  }
+}
+
+function generatePython(
+  projectName: string | undefined,
+  blocks: PlacedBlock[],
+  connections: Connection[],
+  functions: SavedFunction[],
+) {
+  const functionsById = new Map(functions.map((f) => [f.id, f]));
+  const header = `# ${projectName ?? "Untitled"} — generated by NeuronBLK\n\n`;
+
+  if (blocks.length === 0) {
+    return (
+      header +
+      "def main():\n    # Drag blocks onto the canvas to generate code.\n    pass\n\nif __name__ == \"__main__\":\n    main()\n"
+    );
+  }
+
+  // Collect every function transitively reachable via fn.call so nested
+  // reuse (a saved function calling another saved function) is included.
+  const calledIds = new Set<string>();
+  collectCalledFunctionIds(blocks, functionsById, calledIds);
+
+  // Assign each a de-duplicated Python identifier up front — two saved
+  // functions can share a display name without colliding in the file.
+  const usedNames = new Set<string>();
+  const identifierById = new Map<string, string>();
+  for (const fid of calledIds) {
+    const fn = functionsById.get(fid)!;
+    const base = pythonIdentifier(fn.name);
+    let candidate = base;
+    let n = 2;
+    while (usedNames.has(candidate)) candidate = `${base}_${n++}`;
+    usedNames.add(candidate);
+    identifierById.set(fid, candidate);
+  }
+
+  const defSections = [...calledIds].map((fid) => {
+    const fn = functionsById.get(fid)!;
+    const fnBlocks = (fn.blocks as PlacedBlock[]) ?? [];
+    const fnConnections = (fn.connections as Connection[]) ?? [];
+    const startBlocks = fnBlocks.filter((b) => b.defId === "fn.start");
+    const rootIds =
+      startBlocks.length > 0 ? startBlocks.map((b) => b.instanceId) : computeDefaultRoots(fnBlocks, fnConnections);
+    const paramList = fn.params.map((p) => (p.default ? `${p.name}=${p.default}` : p.name)).join(", ");
+    const body = generateBody(fnBlocks, fnConnections, functionsById, identifierById, rootIds);
+    return `def ${identifierById.get(fid)}(${paramList}):\n${body}\n`;
+  });
+
+  const mainRootIds = computeDefaultRoots(blocks, connections);
+  const mainBody = generateBody(blocks, connections, functionsById, identifierById, mainRootIds);
+
+  const defsBlock = defSections.length > 0 ? defSections.join("\n") + "\n" : "";
+  return `${header}${defsBlock}def main():\n${mainBody}\n\nif __name__ == "__main__":\n    main()\n`;
 }
 
 function py(s: string | undefined) {

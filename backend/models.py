@@ -29,3 +29,31 @@ class Project(Base):
         nullable=False,
         default=lambda: datetime.now(timezone.utc),
     )
+
+
+class FunctionDef(Base):
+    """
+    One row per saved, reusable function. Same shape/rationale as Project
+    for `blocks`/`connections` (the function's body — its own mini
+    flowchart), plus `params` (declared parameter names + optional
+    defaults) as its own JSONB column since it's small, structured
+    metadata read/written as a unit alongside the body.
+
+    Private-only for now (no visibility/public column) — every function
+    is scoped to client_id exactly like projects. Public sharing, if it
+    ever happens, is a separate feature to layer on top of this later.
+    """
+
+    __tablename__ = "functions"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    client_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), index=True, nullable=False)
+    name: Mapped[str] = mapped_column(String, nullable=False, default="untitled_function")
+    params: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    blocks: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    connections: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )

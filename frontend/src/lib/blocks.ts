@@ -14,6 +14,10 @@ export type BlockDef = {
   fields?: BlockField[];
   /** Sentence template with {fieldName} placeholders shown around inputs. */
   template?: string;
+  /** Where this block is allowed to appear. Omit for "both" (the common
+   * case). fn.return only makes sense inside a function's own body;
+   * everything else that's context-restricted follows the same idea. */
+  contexts?: ("project" | "function")[];
 };
 
 export type BlockCategory = {
@@ -208,26 +212,32 @@ export const BLOCK_CATEGORIES: BlockCategory[] = [
     color: "function",
     blocks: [
       {
-        id: "fn.define",
-        label: "Define function",
+        id: "fn.start",
+        label: "Function Start",
         category: "functions",
-        description: "Reusable block of logic",
-        template: "def {name}({args})",
-        fields: [
-          { name: "name", kind: "text", placeholder: "my_func", default: "my_func", width: 100 },
-          { name: "args", kind: "text", placeholder: "a, b", default: "", width: 80 },
-        ],
+        description: "Entry point of a function's body — only used inside the Function Editor",
+        template: "Start",
+        contexts: ["function"],
+      },
+      {
+        id: "fn.return",
+        label: "Return",
+        category: "functions",
+        description: "Return a value from the function",
+        template: "return {value}",
+        fields: [{ name: "value", kind: "text", placeholder: "result", default: "", width: 120 }],
+        contexts: ["function"],
       },
       {
         id: "fn.call",
         label: "Call function",
         category: "functions",
-        description: "Invoke a function",
-        template: "call {name}({args})",
-        fields: [
-          { name: "name", kind: "text", placeholder: "my_func", default: "my_func", width: 100 },
-          { name: "args", kind: "text", placeholder: "1, 2", default: "", width: 80 },
-        ],
+        description: "Invoke a saved function",
+        contexts: ["project", "function"],
+        // No static template/fields — the editor renders this block
+        // specially as a function picker whose inline fields are
+        // generated dynamically from whichever function is selected
+        // (see values.__functionId in PlacedBlock).
       },
     ],
   },

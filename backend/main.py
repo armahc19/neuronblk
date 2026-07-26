@@ -8,8 +8,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_session, init_db
-from models import Project
-from schemas import ProjectOut, ProjectUpsert
+from models import FunctionDef, Project
+from schemas import FunctionOut, FunctionUpsert, ProjectOut, ProjectUpsert
 
 
 @asynccontextmanager
@@ -100,3 +100,65 @@ async def delete_project(project_id: uuid.UUID, session: AsyncSession = Depends(
         await session.commit()
     return None
 
+
+@app.get("/api/functions", response_model=list[FunctionOut])
+async def list_functions(
+    client_id: uuid.UUID = Query(...),
+    session: AsyncSession = Depends(get_session),
+):
+    result = await session.execute(select(FunctionDef).where(FunctionDef.client_id == client_id))
+    return result.scalars().all()
+
+
+@app.get("/api/functions/{function_id}", response_model=FunctionOut)
+async def get_function(function_id: uuid.UUID, session: AsyncSession = Depends(get_session)):
+    fn = await session.get(FunctionDef, function_id)
+    if not fn:
+        raise HTTPException(404, "Function not found")
+    return fn
+
+
+@app.put("/api/functions/{function_id}", response_model=FunctionOut)
+async def upsert_function(
+    function_id: uuid.UUID,
+    payload: FunctionUpsert,
+    session: AsyncSession = Depends(get_session),
+):
+    if payload.id != function_id:
+        raise HTTPException(400, "Path id and body id must match")
+
+    existing = await session.get(FunctionDef, function_id)
+
+    if existing:
+        if payload.updated_at < existing.updated_at:
+            return existing
+        existing.name = payload.name
+        existing.params = payload.params
+        existing.blocks = payload.blocks
+        existing.connections = payload.connections
+        existing.updated_at = payload.updated_at
+        existing.client_id = payload.client_id
+    else:
+        existing = FunctionDef(
+            id=payload.id,
+            client_id=payload.client_id,
+            name=payload.name,
+            params=payload.params,
+            blocks=payload.blocks,
+            connections=payload.connections,
+            updated_at=payload.updated_at,
+        )
+        session.add(existing)
+
+    await session.commit()
+    await session.refresh(existing)
+    return existing
+
+
+@app.delete("/api/functions/{function_id}", status_code=204)
+async def delete_function(function_id: uuid.UUID, session: AsyncSession = Depends(get_session)):
+    fn = await session.get(FunctionDef, function_id)
+    if fn:
+        await session.delete(fn)
+        await session.commit()
+    return None

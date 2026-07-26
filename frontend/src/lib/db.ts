@@ -1,7 +1,14 @@
 const DB_NAME = "neuronblk";
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const PROJECTS_STORE = "projects";
+const FUNCTIONS_STORE = "functions";
 const SYNC_QUEUE_STORE = "sync_queue";
+
+export type EntityKind = "project" | "function";
+
+function storeNameFor(kind: EntityKind) {
+  return kind === "project" ? PROJECTS_STORE : FUNCTIONS_STORE;
+}
 
 export type StoredProject = {
   id: string;
@@ -14,11 +21,27 @@ export type StoredProject = {
   dirty: boolean;
 };
 
-export type SyncQueueEntry = {
-  /** == projectId — only one pending op per project needed, since a
-   * later upsert/delete supersedes an earlier one for the same project. */
+export type StoredFunction = {
   id: string;
-  projectId: string;
+  name: string;
+  description: string;
+  /** Declared parameters — fn.call blocks referencing this function
+   * render one inline field per entry, pre-filled with its default. */
+  params: { name: string; default?: string }[];
+  blocks: unknown[];
+  connections: unknown[];
+  updatedAt: number;
+  dirty: boolean;
+};
+
+export type SyncQueueEntry = {
+  /** `${kind}:${entityId}` — composite so a project and a function can
+   * never collide in the queue even if ids were ever reused. Only one
+   * pending op per entity is kept, since a later upsert/delete
+   * supersedes an earlier one for the same entity. */
+  id: string;
+  kind: EntityKind;
+  entityId: string;
   type: "upsert" | "delete";
   createdAt: number;
   attempts: number;
@@ -34,10 +57,14 @@ function openDB(): Promise<IDBDatabase> {
     req.onupgradeneeded = () => {
       const db = req.result;
       // Versioned schema: bump DB_VERSION and add migration logic here
-      // (e.g. db.createObjectStore for new stores, or copy+transform data
-      // for field changes) whenever the shape of StoredProject changes.
+      // whenever the shape of a store changes. v2 adds the "functions"
+      // store; existing "projects"/"sync_queue" data from v1 installs is
+      // left untouched (IndexedDB upgrades are additive by default).
       if (!db.objectStoreNames.contains(PROJECTS_STORE)) {
         db.createObjectStore(PROJECTS_STORE, { keyPath: "id" });
+      }
+      if (!db.objectStoreNames.contains(FUNCTIONS_STORE)) {
+        db.createObjectStore(FUNCTIONS_STORE, { keyPath: "id" });
       }
       if (!db.objectStoreNames.contains(SYNC_QUEUE_STORE)) {
         db.createObjectStore(SYNC_QUEUE_STORE, { keyPath: "id" });
@@ -60,53 +87,52 @@ function toPromise<T>(req: IDBRequest<T>): Promise<T> {
   });
 }
 
-// ---- Projects ----
+// ---- Generic entity storage (projects and functions share this) ----
 
-export async function saveProjectLocal(
-  project: Pick<StoredProject, "id" | "name" | "blocks" | "connections">,
-): Promise<StoredProject> {
+export async function saveEntityLocal<T extends { id: string; updatedAt: number; dirty: boolean }>(
+  kind: EntityKind,
+  entity: Omit<T, "updatedAt" | "dirty">,
+): Promise<T> {
   const db = await openDB();
-  const record: StoredProject = { ...project, updatedAt: Date.now(), dirty: true };
-  await toPromise(store(db, PROJECTS_STORE, "readwrite").put(record));
-  await enqueueSync(project.id);
+  const record = { ...entity, updatedAt: Date.now(), dirty: true } as T;
+  await toPromise(store(db, storeNameFor(kind), "readwrite").put(record));
+  await enqueueSync(kind, entity.id);
   return record;
 }
 
-/** Writes data pulled from the server. Unlike saveProjectLocal, this does
- * NOT mark the record dirty or enqueue a sync push — the data just came
- * from the server, so pushing it right back would be a pointless
- * round-trip (and, in a race, could shadow the fix in markSynced). */
-export async function saveProjectFromServer(
-  project: Pick<StoredProject, "id" | "name" | "blocks" | "connections">,
+/** Writes data pulled from the server — does NOT mark dirty or enqueue a
+ * push, since it just came from the server and pushing it right back
+ * would be a pointless round-trip. */
+export async function saveEntityFromServer<T extends { id: string; updatedAt: number; dirty: boolean }>(
+  kind: EntityKind,
+  entity: Omit<T, "updatedAt" | "dirty">,
   serverUpdatedAt: number,
-): Promise<StoredProject> {
+): Promise<T> {
   const db = await openDB();
-  const record: StoredProject = { ...project, updatedAt: serverUpdatedAt, dirty: false };
-  await toPromise(store(db, PROJECTS_STORE, "readwrite").put(record));
+  const record = { ...entity, updatedAt: serverUpdatedAt, dirty: false } as T;
+  await toPromise(store(db, storeNameFor(kind), "readwrite").put(record));
   return record;
 }
 
-export async function getProjectLocal(id: string): Promise<StoredProject | undefined> {
+export async function getEntityLocal<T>(kind: EntityKind, id: string): Promise<T | undefined> {
   const db = await openDB();
-  return toPromise(store(db, PROJECTS_STORE, "readonly").get(id));
+  return toPromise(store(db, storeNameFor(kind), "readonly").get(id));
 }
 
-export async function listProjectsLocal(): Promise<StoredProject[]> {
+export async function listEntitiesLocal<T>(kind: EntityKind): Promise<T[]> {
   const db = await openDB();
-  return toPromise(store(db, PROJECTS_STORE, "readonly").getAll());
+  return toPromise(store(db, storeNameFor(kind), "readonly").getAll());
 }
 
-export async function deleteProjectLocal(id: string): Promise<void> {
+export async function deleteEntityLocal(kind: EntityKind, id: string): Promise<void> {
   const db = await openDB();
-  await toPromise(store(db, PROJECTS_STORE, "readwrite").delete(id));
-  await enqueueDelete(id);
+  await toPromise(store(db, storeNameFor(kind), "readwrite").delete(id));
+  await enqueueDelete(kind, id);
 }
 
-/** Called after a successful push to the server, or after pulling a
- * server-authoritative copy — clears the dirty flag. */
-export async function markSynced(id: string, serverUpdatedAt: number): Promise<void> {
+export async function markEntitySynced(kind: EntityKind, id: string, serverUpdatedAt: number): Promise<void> {
   const db = await openDB();
-  const s = store(db, PROJECTS_STORE, "readwrite");
+  const s = store(db, storeNameFor(kind), "readwrite");
   const existing = await toPromise(s.get(id));
   if (existing) {
     existing.dirty = false;
@@ -115,15 +141,17 @@ export async function markSynced(id: string, serverUpdatedAt: number): Promise<v
   }
 }
 
-// ---- Sync queue (outbox pattern) ----
+// ---- Sync queue (outbox pattern), shared across entity kinds ----
 
-export async function enqueueSync(projectId: string): Promise<void> {
+export async function enqueueSync(kind: EntityKind, entityId: string): Promise<void> {
   const db = await openDB();
   const s = store(db, SYNC_QUEUE_STORE, "readwrite");
-  const existing: SyncQueueEntry | undefined = await toPromise(s.get(projectId));
+  const queueId = `${kind}:${entityId}`;
+  const existing: SyncQueueEntry | undefined = await toPromise(s.get(queueId));
   const entry: SyncQueueEntry = {
-    id: projectId,
-    projectId,
+    id: queueId,
+    kind,
+    entityId,
     type: "upsert",
     createdAt: existing?.createdAt ?? Date.now(),
     attempts: 0,
@@ -131,11 +159,12 @@ export async function enqueueSync(projectId: string): Promise<void> {
   await toPromise(s.put(entry));
 }
 
-export async function enqueueDelete(projectId: string): Promise<void> {
+export async function enqueueDelete(kind: EntityKind, entityId: string): Promise<void> {
   const db = await openDB();
   const entry: SyncQueueEntry = {
-    id: projectId,
-    projectId,
+    id: `${kind}:${entityId}`,
+    kind,
+    entityId,
     type: "delete",
     createdAt: Date.now(),
     attempts: 0,
@@ -148,15 +177,15 @@ export async function getPendingSync(): Promise<SyncQueueEntry[]> {
   return toPromise(store(db, SYNC_QUEUE_STORE, "readonly").getAll());
 }
 
-export async function clearSyncEntry(id: string): Promise<void> {
+export async function clearSyncEntry(queueId: string): Promise<void> {
   const db = await openDB();
-  await toPromise(store(db, SYNC_QUEUE_STORE, "readwrite").delete(id));
+  await toPromise(store(db, SYNC_QUEUE_STORE, "readwrite").delete(queueId));
 }
 
-export async function bumpSyncAttempt(id: string, error: string): Promise<void> {
+export async function bumpSyncAttempt(queueId: string, error: string): Promise<void> {
   const db = await openDB();
   const s = store(db, SYNC_QUEUE_STORE, "readwrite");
-  const entry: SyncQueueEntry | undefined = await toPromise(s.get(id));
+  const entry: SyncQueueEntry | undefined = await toPromise(s.get(queueId));
   if (entry) {
     entry.attempts += 1;
     entry.lastError = error;
