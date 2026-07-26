@@ -102,6 +102,8 @@ function Home() {
             <span className="text-lg font-semibold tracking-tight">NeuronBLK</span>
           </div>
           <div className="flex items-center gap-2 text-sm text-muted-foreground">
+            <Link className="hover:text-foreground transition-colors" to="/functions">Functions</Link>
+            <span className="text-border">·</span>
             <a className="hover:text-foreground transition-colors" href="#">Docs</a>
             <span className="text-border">·</span>
             <a className="hover:text-foreground transition-colors" href="#">Templates</a>

@@ -10,11 +10,18 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as FunctionsRouteImport } from './routes/functions'
 import { Route as EditorProjectIdRouteImport } from './routes/editor.$projectId'
+import { Route as FunctionEditorFunctionIdRouteImport } from './routes/function-editor.$functionId'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const FunctionsRoute = FunctionsRouteImport.update({
+  id: '/functions',
+  path: '/functions',
   getParentRoute: () => rootRouteImport,
 } as any)
 const EditorProjectIdRoute = EditorProjectIdRouteImport.update({
@@ -22,31 +29,51 @@ const EditorProjectIdRoute = EditorProjectIdRouteImport.update({
   path: '/editor/$projectId',
   getParentRoute: () => rootRouteImport,
 } as any)
+const FunctionEditorFunctionIdRoute =
+  FunctionEditorFunctionIdRouteImport.update({
+    id: '/function-editor/$functionId',
+    path: '/function-editor/$functionId',
+    getParentRoute: () => rootRouteImport,
+  } as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/functions': typeof FunctionsRoute
   '/editor/$projectId': typeof EditorProjectIdRoute
+  '/function-editor/$functionId': typeof FunctionEditorFunctionIdRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/functions': typeof FunctionsRoute
   '/editor/$projectId': typeof EditorProjectIdRoute
+  '/function-editor/$functionId': typeof FunctionEditorFunctionIdRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/functions': typeof FunctionsRoute
   '/editor/$projectId': typeof EditorProjectIdRoute
+  '/function-editor/$functionId': typeof FunctionEditorFunctionIdRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/editor/$projectId'
+  fullPaths:
+    '/' | '/functions' | '/editor/$projectId' | '/function-editor/$functionId'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/editor/$projectId'
-  id: '__root__' | '/' | '/editor/$projectId'
+  to: '/' | '/functions' | '/editor/$projectId' | '/function-editor/$functionId'
+  id:
+    | '__root__'
+    | '/'
+    | '/functions'
+    | '/editor/$projectId'
+    | '/function-editor/$functionId'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  FunctionsRoute: typeof FunctionsRoute
   EditorProjectIdRoute: typeof EditorProjectIdRoute
+  FunctionEditorFunctionIdRoute: typeof FunctionEditorFunctionIdRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -58,6 +85,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/functions': {
+      id: '/functions'
+      path: '/functions'
+      fullPath: '/functions'
+      preLoaderRoute: typeof FunctionsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/editor/$projectId': {
       id: '/editor/$projectId'
       path: '/editor/$projectId'
@@ -65,12 +99,21 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof EditorProjectIdRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/function-editor/$functionId': {
+      id: '/function-editor/$functionId'
+      path: '/function-editor/$functionId'
+      fullPath: '/function-editor/$functionId'
+      preLoaderRoute: typeof FunctionEditorFunctionIdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  FunctionsRoute: FunctionsRoute,
   EditorProjectIdRoute: EditorProjectIdRoute,
+  FunctionEditorFunctionIdRoute: FunctionEditorFunctionIdRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

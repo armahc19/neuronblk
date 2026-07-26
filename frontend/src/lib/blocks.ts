@@ -35,8 +35,8 @@ export const BLOCK_CATEGORIES: BlockCategory[] = [
     icon: Play,
     color: "start",
     blocks: [
-      { id: "start.main", label: "Start", category: "start", description: "Entry point of your program", template: "Start" },
-      { id: "start.stop", label: "Stop", category: "start", description: "End point of your program", template: "Stop" },
+      { id: "start.main", label: "Start", category: "start", description: "Entry point of your program", template: "Start", contexts: ["project"] },
+      { id: "start.stop", label: "Stop", category: "start", description: "End point of your program", template: "Stop", contexts: ["project"] },
     ],
   },
   {

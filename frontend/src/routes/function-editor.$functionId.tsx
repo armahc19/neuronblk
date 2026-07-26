@@ -2,16 +2,12 @@ import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Boxes,
-  Play,
   Save,
-  Settings,
   Search,
   ArrowLeft,
   ChevronDown,
   ChevronUp,
   Code2,
-  TerminalSquare,
-  ScrollText,
   Sparkles,
   Undo2,
   Redo2,
@@ -19,25 +15,20 @@ import {
   ZoomOut,
   Maximize,
   RotateCcw,
-  AlertTriangle,
-  FileDown,
-  FileJson,
-  FileUp,
+  Plus,
   X,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
 import { BLOCK_CATEGORIES, getBlockDef, type BlockDef, type BlockField } from "@/lib/blocks";
-import { projectStore, type Project } from "@/lib/projectStore";
-import { functionStore, type SavedFunction } from "@/lib/functionStore";
+import { functionStore, type FunctionParam, type SavedFunction } from "@/lib/functionStore";
 import { pullFromServer } from "@/lib/sync";
 import { cn } from "@/lib/utils";
 
-export const Route = createFileRoute("/editor/$projectId")({
-  component: Editor,
+export const Route = createFileRoute("/function-editor/$functionId")({
+  component: FunctionEditor,
 });
 
 type PlacedBlock = {
@@ -48,15 +39,6 @@ type PlacedBlock = {
   values: Record<string, string>;
 };
 
-/**
- * Port model:
- * - "in"       top,    target — every block
- * - "out"      bottom, source — start/input/output/process blocks
- * - "true"     right,  source — conditions (diamond) only
- * - "false"    bottom, source — conditions (diamond) only
- * - "loopback" left,   target — loops (diamond) only; a body block's "out"
- *              connects here to represent "repeat".
- */
 type PortId = "in" | "out" | "true" | "false" | "loopback";
 
 type Connection = {
@@ -69,18 +51,15 @@ type Connection = {
 
 const BLOCK_W = 260;
 
-// Approximate rendered height per shape category, used only for connector
-// anchor math. Actual DOM height can vary slightly (auto), which is fine
-// visually — these just need to be close.
 const SHAPE_H: Record<string, number> = {
-  start: 64, // h-16 oval
-  input: 96, // h-24 parallelogram
+  start: 64,
+  input: 96,
   output: 96,
-  conditions: 120, // diamond
-  loops: 120, // diamond
-  connector: 40, // small circle
+  conditions: 120,
+  loops: 120,
+  connector: 40,
 };
-const DEFAULT_H = 96; // process rectangle min-height
+const DEFAULT_H = 96;
 
 function shapeHeight(category: string) {
   return SHAPE_H[category] ?? DEFAULT_H;
@@ -107,23 +86,20 @@ function blockPortPos(b: PlacedBlock, portId: PortId) {
   return getPortPos(b, def?.category ?? "process", portId);
 }
 
-function Editor() {
-  const { projectId } = Route.useParams();
+function FunctionEditor() {
+  const { functionId } = Route.useParams();
   const navigate = useNavigate();
-  const [project, setProject] = useState<Project | null>(null);
-  const [functions, setFunctions] = useState<SavedFunction[]>([]);
+  const [fn, setFn] = useState<SavedFunction | null>(null);
   const [nameDraft, setNameDraft] = useState("");
   const [editingName, setEditingName] = useState(false);
+  const [params, setParams] = useState<FunctionParam[]>([]);
   const [query, setQuery] = useState("");
   const [placed, setPlaced] = useState<PlacedBlock[]>([]);
   const [connections, setConnections] = useState<Connection[]>([]);
   const [pending, setPending] = useState<{ from: string; fromPort: PortId; x: number; y: number } | null>(null);
   const hoveredPortRef = useRef<{ blockId: string; portId: PortId } | null>(null);
   const [bottomOpen, setBottomOpen] = useState(true);
-  const [running, setRunning] = useState(false);
-  const [logs, setLogs] = useState<string[]>([]);
-  const [terminal, setTerminal] = useState<string[]>([]);
-  const [ranOnce, setRanOnce] = useState(false);
+  const [functions, setFunctions] = useState<SavedFunction[]>([]);
   const canvasRef = useRef<HTMLDivElement>(null);
   const placedRef = useRef<PlacedBlock[]>(placed);
   useEffect(() => {
@@ -133,22 +109,13 @@ function Editor() {
   useEffect(() => {
     connectionsRef.current = connections;
   }, [connections]);
-  // Guards the autosave effect below against firing on the initial load
-  // itself — without this, hydrating state from storage looks identical
-  // to a real edit, which would immediately re-save (and re-timestamp)
-  // whatever was just read, clobbering any newer server data with stale
-  // local data on every single page load.
   const skipNextAutosaveRef = useRef(true);
 
   // ---- Undo / redo ----
-  // Snapshots are taken at the START of a discrete action (drag begins,
-  // field gains focus, connection starts, block added/removed) rather
-  // than on every intermediate change — so dragging a block doesn't
-  // create dozens of undo steps, only one per drag gesture.
   const HISTORY_LIMIT = 50;
   const pastRef = useRef<{ placed: PlacedBlock[]; connections: Connection[] }[]>([]);
   const futureRef = useRef<{ placed: PlacedBlock[]; connections: Connection[] }[]>([]);
-  const [historyTick, setHistoryTick] = useState(0); // bumped to force re-render for button disabled state
+  const [historyTick, setHistoryTick] = useState(0);
   const canUndo = pastRef.current.length > 0;
   const canRedo = futureRef.current.length > 0;
 
@@ -188,8 +155,6 @@ function Editor() {
 
   const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
-  /** Converts a viewport-relative mouse position (clientX/Y) into world
-   * (canvas content) coordinates, accounting for the current pan/zoom. */
   const screenToWorld = useCallback((clientX: number, clientY: number) => {
     const rect = canvasRef.current!.getBoundingClientRect();
     const cam = cameraRef.current;
@@ -237,19 +202,12 @@ function Editor() {
       const worldY = (cursorY - cam.panY) / cam.scale;
       const delta = -e.deltaY * 0.0015;
       const newScale = clamp(cam.scale * (1 + delta), MIN_SCALE, MAX_SCALE);
-      setCamera({
-        scale: newScale,
-        panX: cursorX - worldX * newScale,
-        panY: cursorY - worldY * newScale,
-      });
+      setCamera({ scale: newScale, panX: cursorX - worldX * newScale, panY: cursorY - worldY * newScale });
     }
     el.addEventListener("wheel", onWheel, { passive: false });
     return () => el.removeEventListener("wheel", onWheel);
   }, []);
 
-  /** Middle-mouse drag, or left-click drag while Space is held, pans the
-   * canvas. A left-click on empty canvas (no block/port under it) clears
-   * the current selection instead. */
   function handleCanvasMouseDown(e: React.MouseEvent) {
     const isMiddle = e.button === 1;
     const isSpaceLeftDrag = e.button === 0 && spaceDownRef.current;
@@ -273,6 +231,8 @@ function Editor() {
       setSelectedIds(new Set());
     }
   }
+
+  // ---- Selection ----
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   function handleSelectBlock(id: string, shiftKey: boolean) {
     setSelectedIds((prev) => {
@@ -329,8 +289,6 @@ function Editor() {
     setPlaced((prev) => [...prev, ...newBlocks]);
     setConnections((prev) => [...prev, ...newConns]);
     setSelectedIds(new Set(newBlocks.map((b) => b.instanceId)));
-    // Step the clipboard's reference position so repeated pastes cascade
-    // diagonally instead of stacking exactly on top of each other.
     clipboardRef.current = { blocks: newBlocks, connections: newConns };
   }
 
@@ -361,13 +319,12 @@ function Editor() {
 
     function onKeyDown(e: KeyboardEvent) {
       if (e.code === "Space" && !isEditableTarget(e.target)) {
-        e.preventDefault(); // avoid page scroll
+        e.preventDefault();
         spaceDownRef.current = true;
         setSpaceDown(true);
         return;
       }
-
-      if (isEditableTarget(e.target)) return; // let native behavior work inside text fields
+      if (isEditableTarget(e.target)) return;
 
       if (e.key === "Delete" || e.key === "Backspace") {
         if (selectedIds.size > 0) {
@@ -391,7 +348,7 @@ function Editor() {
       } else if (key === "v") {
         pasteClipboard();
       } else if (key === "d") {
-        e.preventDefault(); // otherwise the browser bookmarks the page
+        e.preventDefault();
         duplicateSelection();
       }
     }
@@ -413,222 +370,90 @@ function Editor() {
 
   useEffect(() => {
     let cancelled = false;
-    skipNextAutosaveRef.current = true; // reset per project load — see autosave effect below
+    skipNextAutosaveRef.current = true;
     pastRef.current = [];
     futureRef.current = [];
     (async () => {
-      // Pull first: without this, a newer server copy (e.g. edited
-      // directly in Postgres, or from another device) would never be
-      // seen — the editor would just hydrate from whatever's already in
-      // local IndexedDB, which could be stale. This also pulls functions
-      // (pullFromServer covers both kinds), so the list below is fresh.
       await pullFromServer();
-      const p = await projectStore.get(projectId);
+      const f = await functionStore.get(functionId);
       if (cancelled) return;
-      if (!p) {
-        navigate({ to: "/" });
+      if (!f) {
+        navigate({ to: "/functions" });
         return;
       }
-      setProject(p);
-      setNameDraft(p.name);
-      setPlaced((p.blocks as PlacedBlock[] | undefined) ?? []);
-      setConnections((p.connections as Connection[] | undefined) ?? []);
-      setFunctions(await functionStore.list());
+      setFn(f);
+      setNameDraft(f.name);
+      setParams(f.params ?? []);
+      setPlaced((f.blocks as PlacedBlock[] | undefined) ?? []);
+      setConnections((f.connections as Connection[] | undefined) ?? []);
+      setFunctions((await functionStore.list()).filter((x) => x.id !== functionId));
     })();
     return () => {
       cancelled = true;
     };
-  }, [projectId, navigate]);
+  }, [functionId, navigate]);
 
   useEffect(() => {
-    const onFunctionsUpdated = () => void functionStore.list().then(setFunctions);
+    const onFunctionsUpdated = () =>
+      void functionStore.list().then((list) => setFunctions(list.filter((x) => x.id !== functionId)));
     window.addEventListener("neuronblk:functions-updated", onFunctionsUpdated);
     return () => window.removeEventListener("neuronblk:functions-updated", onFunctionsUpdated);
-  }, []);
+  }, [functionId]);
+
+  async function commitName() {
+    setEditingName(false);
+    if (!fn) return;
+    const name = nameDraft.trim() || fn.name;
+    await functionStore.rename(fn.id, name);
+    setFn({ ...fn, name });
+  }
+
+  async function handleSave() {
+    if (!fn) return;
+    await functionStore.saveState(fn.id, fn.name, fn.description, params, placed, connections);
+    toast.success("Function saved", { description: "Stored locally and queued to sync." });
+  }
+
+  useEffect(() => {
+    if (!fn) return;
+    const timer = setTimeout(() => {
+      void functionStore.saveState(fn.id, fn.name, fn.description, params, placed, connections);
+    }, 800);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fn, params, placed, connections]);
+
+  function addParam() {
+    setParams((prev) => [...prev, { name: `param${prev.length + 1}`, default: "" }]);
+  }
+  function updateParam(index: number, patch: Partial<FunctionParam>) {
+    setParams((prev) => prev.map((p, i) => (i === index ? { ...p, ...patch } : p)));
+  }
+  function removeParam(index: number) {
+    setParams((prev) => prev.filter((_, i) => i !== index));
+  }
 
   const filteredCategories = useMemo(() => {
     const q = query.trim().toLowerCase();
     return BLOCK_CATEGORIES.map((c) => ({
       ...c,
       blocks: c.blocks.filter((b) => {
-        if (b.contexts && !b.contexts.includes("project")) return false;
+        if (b.contexts && !b.contexts.includes("function")) return false;
         if (!q) return true;
         return b.label.toLowerCase().includes(q) || b.description.toLowerCase().includes(q);
       }),
     })).filter((c) => c.blocks.length > 0);
   }, [query]);
 
-  const orderedBlocks = useMemo(() => orderByConnections(placed, connections), [placed, connections]);
   const validation = useMemo(
-    () => computeValidation(placed, connections, new Set(functions.map((f) => f.id))),
+    () => computeFunctionValidation(placed, connections, new Set(functions.map((f) => f.id))),
     [placed, connections, functions],
   );
-  const generatedPython = useMemo(
-    () => generatePython(project?.name, placed, connections, functions),
-    [project?.name, placed, connections, functions],
+
+  const preview = useMemo(
+    () => generateFunctionPreview(nameDraft, params, placed, connections, functions),
+    [nameDraft, params, placed, connections, functions],
   );
-
-  async function commitName() {
-    setEditingName(false);
-    if (!project) return;
-    const name = nameDraft.trim() || project.name;
-    await projectStore.rename(project.id, name);
-    setProject({ ...project, name });
-  }
-
-  async function handleSave() {
-    if (!project) return;
-    await projectStore.saveState(project.id, project.name, placed, connections);
-    toast.success("Project saved", { description: "Stored locally and queued to sync." });
-  }
-
-  function downloadBlob(content: string, mimeType: string, filename: string) {
-    const blob = new Blob([content], { type: mimeType });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-  }
-
-  function safeFileName(name: string) {
-    return (name || "project").trim().replace(/[^a-z0-9_\-]+/gi, "_") || "project";
-  }
-
-  function downloadPython() {
-    downloadBlob(generatedPython, "text/x-python", `${safeFileName(project?.name)}.py`);
-  }
-
-  function exportFlowchart() {
-    const payload = {
-      format: "neuronblk-flowchart",
-      version: 1,
-      name: project?.name ?? "Untitled",
-      exportedAt: new Date().toISOString(),
-      blocks: placed,
-      connections,
-    };
-    downloadBlob(JSON.stringify(payload, null, 2), "application/json", `${safeFileName(project?.name)}.neuronblk.json`);
-  }
-
-  const importInputRef = useRef<HTMLInputElement>(null);
-
-  const VALID_PORT_IDS = new Set<string>(["in", "out", "true", "false", "loopback"]);
-  function isPortId(v: unknown): v is PortId {
-    return typeof v === "string" && VALID_PORT_IDS.has(v);
-  }
-
-  async function handleImportFile(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    e.target.value = ""; // reset so re-selecting the same file still fires onChange
-    if (!file) return;
-
-    let data: any;
-    try {
-      data = JSON.parse(await file.text());
-    } catch {
-      toast.error("Import failed", { description: "That file isn't valid JSON." });
-      return;
-    }
-
-    const rawBlocks = Array.isArray(data?.blocks) ? data.blocks : null;
-    const rawConns = Array.isArray(data?.connections) ? data.connections : null;
-    if (!rawBlocks || !rawConns) {
-      toast.error("Invalid file", { description: "This doesn't look like a NeuronBLK flowchart export." });
-      return;
-    }
-
-    // Validate each block/connection's shape so malformed or hand-edited
-    // JSON can't crash the canvas — anything that doesn't fit is dropped
-    // rather than rendered.
-    const validBlocks: PlacedBlock[] = rawBlocks
-      .filter(
-        (b: any) =>
-          b &&
-          typeof b.instanceId === "string" &&
-          typeof b.defId === "string" &&
-          typeof b.x === "number" &&
-          typeof b.y === "number" &&
-          !!getBlockDef(b.defId),
-      )
-      .map((b: any) => ({
-        instanceId: b.instanceId,
-        defId: b.defId,
-        x: b.x,
-        y: b.y,
-        values: b.values && typeof b.values === "object" ? b.values : {},
-      }));
-    const validIds = new Set(validBlocks.map((b) => b.instanceId));
-    const validConns: Connection[] = rawConns.filter(
-      (c: any) =>
-        c &&
-        typeof c.id === "string" &&
-        validIds.has(c.from) &&
-        validIds.has(c.to) &&
-        isPortId(c.fromPort) &&
-        isPortId(c.toPort),
-    );
-
-    const droppedBlocks = rawBlocks.length - validBlocks.length;
-    const droppedConns = rawConns.length - validConns.length;
-
-    commitHistory({ placed, connections });
-    setPlaced(validBlocks);
-    setConnections(validConns);
-    setSelectedIds(new Set());
-    resetZoom();
-
-    if (droppedBlocks > 0 || droppedConns > 0) {
-      toast.warning("Imported with some issues", {
-        description: `Loaded ${validBlocks.length} block(s). Skipped ${droppedBlocks} invalid block(s) and ${droppedConns} invalid connection(s).`,
-      });
-    } else {
-      toast.success("Flowchart imported", {
-        description: `${validBlocks.length} block${validBlocks.length === 1 ? "" : "s"} loaded.`,
-      });
-    }
-  }
-
-  // Debounced autosave: persist canvas edits ~800ms after the user stops
-  // dragging/typing, so work survives a refresh without needing a manual
-  // Save click. The skipNextAutosaveRef guard (reset per project load,
-  // above) prevents this from firing on the initial hydration itself —
-  // only genuine subsequent edits trigger a save.
-  useEffect(() => {
-    if (!project) return;
-    if (skipNextAutosaveRef.current) {
-      skipNextAutosaveRef.current = false;
-      return;
-    }
-    const timer = setTimeout(() => {
-      void projectStore.saveState(project.id, project.name, placed, connections);
-    }, 800);
-    return () => clearTimeout(timer);
-  }, [project, placed, connections]);
-
-  function handleRun() {
-    setRunning(true);
-    setBottomOpen(true);
-    setTerminal([]);
-    setLogs([`[${new Date().toLocaleTimeString()}] Starting run…`]);
-    setTimeout(() => {
-      if (placed.length === 0) {
-        setLogs((l) => [...l, `[${new Date().toLocaleTimeString()}] No blocks on the canvas. Nothing to run.`]);
-      } else {
-        setTerminal([
-          "> python main.py",
-          ...orderedBlocks.map((b) => `→ ${getBlockDef(b.defId)?.label ?? b.defId}`),
-          "Done in 0.42s",
-        ]);
-        setLogs((l) => [...l, `[${new Date().toLocaleTimeString()}] Run finished successfully.`]);
-      }
-      setRunning(false);
-      setRanOnce(true);
-    }, 800);
-  }
 
   function handleDragOver(e: React.DragEvent) {
     e.preventDefault();
@@ -682,8 +507,6 @@ function Editor() {
         setConnections((prev) => [
           ...prev.filter((c) => {
             const targetsSamePort = c.to === target.blockId && c.toPort === target.portId;
-            // Connectors are merge points — keep prior connections into
-            // their "in" port instead of replacing them.
             if (targetsSamePort) return targetIsConnector;
             if (c.from === fromId && c.fromPort === fromPort) return false;
             return true;
@@ -698,7 +521,7 @@ function Editor() {
     window.addEventListener("mouseup", up);
   }
 
-  if (!project) return null;
+  if (!fn) return null;
 
   const blockById = new Map(placed.map((b) => [b.instanceId, b]));
 
@@ -707,17 +530,17 @@ function Editor() {
       <header className="flex h-14 shrink-0 items-center justify-between border-b border-border bg-surface px-4">
         <div className="flex items-center gap-3">
           <Link
-            to="/"
+            to="/functions"
             className="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
-            aria-label="Back to home"
+            aria-label="Back to functions"
           >
             <ArrowLeft className="h-4 w-4" />
           </Link>
           <div className="flex items-center gap-2">
-            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary text-primary-foreground shadow-soft">
+            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-violet-500 text-white shadow-soft">
               <Boxes className="h-4 w-4" strokeWidth={2.25} />
             </div>
-            <span className="text-sm font-semibold tracking-tight">NeuronBLK</span>
+            <span className="text-sm font-semibold tracking-tight">Function Editor</span>
           </div>
           <div className="mx-2 h-5 w-px bg-border" />
           {editingName ? (
@@ -729,20 +552,51 @@ function Editor() {
               onKeyDown={(e) => {
                 if (e.key === "Enter") commitName();
                 if (e.key === "Escape") {
-                  setNameDraft(project.name);
+                  setNameDraft(fn.name);
                   setEditingName(false);
                 }
               }}
-              className="h-8 w-64 rounded-lg text-sm"
+              className="h-8 w-56 rounded-lg text-sm"
             />
           ) : (
             <button
               onClick={() => setEditingName(true)}
               className="rounded-lg px-2 py-1 text-sm font-medium text-foreground hover:bg-muted transition-colors"
             >
-              {project.name}
+              {fn.name}
             </button>
           )}
+
+          <div className="mx-2 h-5 w-px bg-border" />
+          <div className="flex flex-wrap items-center gap-1.5">
+            {params.map((p, i) => (
+              <div key={i} className="flex items-center gap-1 rounded-full bg-muted px-2 py-1">
+                <input
+                  value={p.name}
+                  onChange={(e) => updateParam(i, { name: e.target.value })}
+                  className="w-16 bg-transparent text-xs font-medium outline-none"
+                  placeholder="name"
+                />
+                <span className="text-[10px] text-muted-foreground">=</span>
+                <input
+                  value={p.default ?? ""}
+                  onChange={(e) => updateParam(i, { default: e.target.value })}
+                  className="w-14 bg-transparent text-xs text-muted-foreground outline-none"
+                  placeholder="default"
+                />
+                <button onClick={() => removeParam(i)} className="text-muted-foreground hover:text-destructive">
+                  <X className="h-3 w-3" />
+                </button>
+              </div>
+            ))}
+            <button
+              onClick={addParam}
+              className="flex h-7 items-center gap-1 rounded-full border border-dashed border-border px-2 text-xs font-medium text-muted-foreground hover:bg-muted"
+            >
+              <Plus className="h-3 w-3" />
+              Param
+            </button>
+          </div>
         </div>
 
         <div className="flex items-center gap-2">
@@ -750,7 +604,6 @@ function Editor() {
             onClick={undo}
             disabled={!canUndo}
             className="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:pointer-events-none disabled:opacity-35"
-            aria-label="Undo"
             title="Undo (Ctrl+Z)"
           >
             <Undo2 className="h-4 w-4" />
@@ -759,65 +612,15 @@ function Editor() {
             onClick={redo}
             disabled={!canRedo}
             className="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:pointer-events-none disabled:opacity-35"
-            aria-label="Redo"
             title="Redo (Ctrl+Shift+Z)"
           >
             <Redo2 className="h-4 w-4" />
           </button>
           <div className="mr-1 h-5 w-px bg-border" />
-          <Button onClick={handleRun} disabled={running} size="sm" className="h-9 rounded-lg px-3.5 shadow-soft">
-            <Play className="mr-1.5 h-3.5 w-3.5" fill="currentColor" />
-            {running ? "Running…" : "Run"}
-          </Button>
           <Button onClick={handleSave} variant="outline" size="sm" className="h-9 rounded-lg px-3.5">
             <Save className="mr-1.5 h-3.5 w-3.5" />
             Save
           </Button>
-          <div className="ml-1 h-5 w-px bg-border" />
-          <button
-            onClick={exportFlowchart}
-            className="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
-            aria-label="Export flowchart as JSON"
-            title="Export flowchart (.json)"
-          >
-            <FileJson className="h-4 w-4" />
-          </button>
-          <button
-            onClick={() => importInputRef.current?.click()}
-            className="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
-            aria-label="Import flowchart from JSON"
-            title="Import flowchart (.json)"
-          >
-            <FileUp className="h-4 w-4" />
-          </button>
-          <input
-            ref={importInputRef}
-            type="file"
-            accept="application/json"
-            onChange={handleImportFile}
-            className="hidden"
-          />
-          <Link
-            to="/functions"
-            className="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
-            aria-label="Manage functions"
-            title="Functions library"
-          >
-            <Boxes className="h-4 w-4" />
-          </Link>
-          <div className="ml-1 h-5 w-px bg-border" />
-          <button
-            className="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
-            aria-label="Settings"
-          >
-            <Settings className="h-4 w-4" />
-          </button>
-          <button
-            className="flex h-9 w-9 items-center justify-center rounded-full bg-primary-soft text-primary text-xs font-semibold hover:bg-primary/15 transition-colors"
-            aria-label="Profile"
-          >
-            NB
-          </button>
         </div>
       </header>
 
@@ -851,9 +654,7 @@ function Editor() {
               </div>
             ))}
             {filteredCategories.length === 0 && (
-              <div className="mt-8 text-center text-xs text-muted-foreground">
-                No blocks match "{query}"
-              </div>
+              <div className="mt-8 text-center text-xs text-muted-foreground">No blocks match "{query}"</div>
             )}
           </div>
         </aside>
@@ -879,11 +680,10 @@ function Editor() {
                 transformOrigin: "0 0",
               }}
             >
-              {/* Connection lines */}
               <svg className="pointer-events-none absolute left-0 top-0 overflow-visible">
                 <defs>
                   <marker
-                    id="loopback-arrow"
+                    id="fn-loopback-arrow"
                     viewBox="0 0 10 10"
                     refX="8"
                     refY="5"
@@ -900,7 +700,6 @@ function Editor() {
                   if (!from || !to) return null;
                   const a = blockPortPos(from, c.fromPort);
                   const b = blockPortPos(to, c.toPort);
-
                   if (c.toPort === "loopback") {
                     return (
                       <path
@@ -910,11 +709,10 @@ function Editor() {
                         stroke="#8b5cf6"
                         strokeWidth={2}
                         strokeDasharray="5 4"
-                        markerEnd="url(#loopback-arrow)"
+                        markerEnd="url(#fn-loopback-arrow)"
                       />
                     );
                   }
-
                   const stroke =
                     c.fromPort === "true" ? "#10b981" : c.fromPort === "false" ? "#f43f5e" : "var(--color-primary)";
                   return <path key={c.id} d={bezier(a, b)} fill="none" stroke={stroke} strokeWidth={2} />;
@@ -942,7 +740,6 @@ function Editor() {
                   })()}
               </svg>
 
-              {/* Placed blocks */}
               {placed.map((b) => (
                 <CanvasBlock
                   key={b.instanceId}
@@ -951,9 +748,6 @@ function Editor() {
                   onSelect={(shiftKey) => handleSelectBlock(b.instanceId, shiftKey)}
                   panModeActive={spaceDown}
                   screenToWorld={screenToWorld}
-                  issues={validation.blockIssues.get(b.instanceId) ?? []}
-                  unreachable={validation.unreachableIds.has(b.instanceId)}
-                  functions={functions}
                   onRemove={() => removeBlocks(new Set([b.instanceId]))}
                   onMove={(x, y) => updateBlock(b.instanceId, { x, y })}
                   onFieldChange={(field, value) => updateValue(b.instanceId, field, value)}
@@ -961,6 +755,9 @@ function Editor() {
                   onPortEnter={(portId) => (hoveredPortRef.current = { blockId: b.instanceId, portId })}
                   onPortLeave={() => (hoveredPortRef.current = null)}
                   onBeforeChange={() => commitHistory({ placed, connections })}
+                  issues={validation.blockIssues.get(b.instanceId) ?? []}
+                  unreachable={validation.unreachableIds.has(b.instanceId)}
+                  functions={functions}
                   connecting={!!pending && pending.from !== b.instanceId}
                 />
               ))}
@@ -968,13 +765,10 @@ function Editor() {
 
             {placed.length === 0 && (
               <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
-                <p className="text-sm text-muted-foreground">
-                  Drag a block here to get started
-                </p>
+                <p className="text-sm text-muted-foreground">Drag a Function Start block here to begin</p>
               </div>
             )}
 
-            {/* Program-level validation messages — small banner, not a dialog */}
             {validation.globalMessages.length > 0 && (
               <div className="absolute left-4 top-4 z-30 flex flex-col gap-1.5">
                 {validation.globalMessages.map((m, i) => (
@@ -993,13 +787,11 @@ function Editor() {
               </div>
             )}
 
-            {/* Zoom / pan toolbar */}
             <div className="absolute bottom-4 right-4 z-30 flex items-center gap-0.5 rounded-lg border border-border bg-surface/95 px-1.5 py-1 shadow-lift backdrop-blur">
               <button
                 onClick={zoomOut}
                 className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
                 title="Zoom out"
-                aria-label="Zoom out"
               >
                 <ZoomOut className="h-3.5 w-3.5" />
               </button>
@@ -1010,7 +802,6 @@ function Editor() {
                 onClick={zoomIn}
                 className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
                 title="Zoom in"
-                aria-label="Zoom in"
               >
                 <ZoomIn className="h-3.5 w-3.5" />
               </button>
@@ -1019,7 +810,6 @@ function Editor() {
                 onClick={resetZoom}
                 className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
                 title="Reset zoom"
-                aria-label="Reset zoom"
               >
                 <RotateCcw className="h-3.5 w-3.5" />
               </button>
@@ -1027,62 +817,59 @@ function Editor() {
                 onClick={fitToScreen}
                 className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
                 title="Fit to screen"
-                aria-label="Fit to screen"
               >
                 <Maximize className="h-3.5 w-3.5" />
               </button>
             </div>
           </div>
 
-          <BottomPanel
-            open={bottomOpen}
-            onToggle={() => setBottomOpen((o) => !o)}
-            python={generatedPython}
-            terminal={terminal}
-            logs={logs}
-            onDownloadPython={downloadPython}
-          />
-        </div>
-
-        <aside className="flex w-80 shrink-0 flex-col border-l border-border bg-surface">
-          <div className="flex h-11 items-center justify-between border-b border-border px-4">
-            <div className="flex items-center gap-2">
-              <Sparkles className="h-3.5 w-3.5 text-primary" />
-              <span className="text-sm font-semibold">Preview</span>
-            </div>
-            <span className="rounded-full bg-muted px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-              Live
-            </span>
-          </div>
-          <div className="scrollbar-thin flex-1 overflow-y-auto p-4">
-            {!ranOnce ? (
-              <div className="flex h-full flex-col items-center justify-center rounded-2xl border border-dashed border-border bg-background/60 p-8 text-center">
-                <div className="mb-3 flex h-10 w-10 items-center justify-center rounded-xl bg-primary-soft text-primary">
-                  <Play className="h-4 w-4" fill="currentColor" />
-                </div>
-                <div className="text-sm font-semibold">Run your project to see preview.</div>
-                <p className="mt-1 text-xs text-muted-foreground">
-                  Output, AI predictions, images and charts appear here.
-                </p>
+          <div
+            className={cn(
+              "flex shrink-0 flex-col border-t border-border bg-surface transition-all",
+              bottomOpen ? "h-56" : "h-10",
+            )}
+          >
+            <div className="flex h-10 items-center justify-between border-b border-border px-3">
+              <div className="flex items-center gap-1.5 text-sm font-medium">
+                <Code2 className="h-3.5 w-3.5 text-muted-foreground" />
+                Preview
               </div>
-            ) : (
-              <div className="space-y-3">
-                <div className="rounded-xl border border-border bg-background p-3 text-xs">
-                  <div className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Program output</div>
-                  <div className="font-mono text-foreground">
-                    {terminal.length ? terminal[terminal.length - 2] ?? "—" : "No output yet"}
-                  </div>
-                </div>
-                <div className="rounded-xl border border-border bg-background p-3 text-xs">
-                  <div className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Blocks executed</div>
-                  <div className="text-foreground">{placed.length} block{placed.length === 1 ? "" : "s"}</div>
-                </div>
-                <div className="rounded-xl border border-border bg-background p-3 text-xs">
-                  <div className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Connections</div>
-                  <div className="text-foreground">{connections.length}</div>
-                </div>
+              <button
+                onClick={() => setBottomOpen((o) => !o)}
+                className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
+              >
+                {bottomOpen ? <ChevronDown className="h-4 w-4" /> : <ChevronUp className="h-4 w-4" />}
+              </button>
+            </div>
+            {bottomOpen && (
+              <div className="scrollbar-thin flex-1 overflow-auto p-4">
+                <pre className="font-mono text-[12.5px] leading-relaxed text-foreground">
+                  <code>{preview}</code>
+                </pre>
               </div>
             )}
+          </div>
+        </div>
+
+        <aside className="flex w-72 shrink-0 flex-col border-l border-border bg-surface">
+          <div className="flex h-11 items-center gap-2 border-b border-border px-4">
+            <Sparkles className="h-3.5 w-3.5 text-primary" />
+            <span className="text-sm font-semibold">About this function</span>
+          </div>
+          <div className="flex-1 overflow-y-auto p-4">
+            <label className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+              Description
+            </label>
+            <textarea
+              value={fn.description}
+              onChange={(e) => setFn({ ...fn, description: e.target.value })}
+              placeholder="What does this function do? Shown when picking it from fn.call."
+              className="mt-1.5 h-24 w-full resize-none rounded-lg border border-border bg-background p-2 text-sm outline-none focus:ring-2 focus:ring-primary"
+            />
+            <p className="mt-4 text-xs text-muted-foreground">
+              This function is private to you and can be reused from any project, or from another function's body
+              (nested calls are supported).
+            </p>
           </div>
         </aside>
       </div>
@@ -1093,7 +880,6 @@ function Editor() {
 
 function DraggableBlock({ block, color }: { block: BlockDef; color: string }) {
   const isInput = block.category === "input";
-
   let content = null;
 
   if (block.category === "start") {
@@ -1138,7 +924,6 @@ function DraggableBlock({ block, color }: { block: BlockDef; color: string }) {
   } else {
     const segments = block.template ? renderTemplate(block.template, block.fields ?? []) : null;
     let innerContent;
-
     if (segments && block.fields && block.fields.length > 0) {
       innerContent = (
         <div className="flex flex-wrap items-center justify-center gap-1 mt-0.5 pointer-events-none">
@@ -1160,7 +945,6 @@ function DraggableBlock({ block, color }: { block: BlockDef; color: string }) {
     } else {
       innerContent = <div className="text-[10px] font-medium text-center truncate w-full">{block.label}</div>;
     }
-
     content = (
       <div className="mx-auto flex h-auto min-h-[46px] w-[95%] flex-col items-center justify-center rounded-md border-2 bg-blue-500 border-blue-700 p-1.5 text-white shadow-sm">
         <div className="mb-0 text-[7px] font-bold uppercase tracking-wider opacity-80">Process</div>
@@ -1186,13 +970,6 @@ function DraggableBlock({ block, color }: { block: BlockDef; color: string }) {
   );
 }
 
-/**
- * Renders a block on the canvas in the same shape/color as its sidebar
- * counterpart, with ports matching its role in the flowchart:
- * - start/input/output/process: in (top), out (bottom)
- * - conditions (diamond): in (top), true (right), false (bottom)
- * - loops (diamond): in (top), out (bottom, loop body), loopback (left)
- */
 function CanvasBlock({
   block,
   onRemove,
@@ -1218,23 +995,13 @@ function CanvasBlock({
   onStartConnect: (portId: PortId, clientX: number, clientY: number) => void;
   onPortEnter: (portId: PortId) => void;
   onPortLeave: () => void;
-  /** Called once, right before a drag or field edit begins, to commit an
-   * undo/redo snapshot of the pre-change state. */
   onBeforeChange: () => void;
   selected: boolean;
   onSelect: (shiftKey: boolean) => void;
-  /** True while Space is held — drag should pan the canvas instead of
-   * moving this block. */
   panModeActive: boolean;
   screenToWorld: (clientX: number, clientY: number) => { x: number; y: number };
-  /** Validation problems specific to this block — rendered as a small
-   * red badge with the messages in its hover tooltip. */
   issues: ValidationIssue[];
-  /** True if this block exists but is never reached from any Start
-   * block — dead code, shown dimmed with a dashed outline. */
   unreachable: boolean;
-  /** The saved-function library, needed only by fn.call's dynamic
-   * picker — every other block ignores this. */
   functions: SavedFunction[];
   connecting: boolean;
 }) {
@@ -1274,8 +1041,8 @@ function CanvasBlock({
   );
 
   const startDrag = (e: React.MouseEvent) => {
-    if (e.button !== 0) return; // left-click only — let middle-click bubble to canvas panning
-    if (panModeActive) return; // Space held — let it bubble to canvas panning instead
+    if (e.button !== 0) return;
+    if (panModeActive) return;
     if ((e.target as HTMLElement).closest("[data-no-drag]")) return;
     onSelect(e.shiftKey);
     onBeforeChange();
@@ -1317,9 +1084,7 @@ function CanvasBlock({
         }}
       >
         <div className="flex flex-col items-center gap-1 px-5" style={{ transform: "skewX(15deg)" }}>
-          <div className="text-[9px] font-bold uppercase tracking-wider text-white/80">
-            {isInput ? "Input" : "Output"}
-          </div>
+          <div className="text-[9px] font-bold uppercase tracking-wider text-white/80">{isInput ? "Input" : "Output"}</div>
           {fieldsContent}
         </div>
       </div>
@@ -1348,13 +1113,15 @@ function CanvasBlock({
   } else {
     shape = (
       <div className="flex min-h-[96px] w-full flex-col items-center justify-center gap-1.5 rounded-2xl border-2 bg-blue-500 border-blue-700 px-4 py-3 shadow-lift">
-        <div className="text-[10px] font-bold uppercase tracking-wider text-white/80">Process</div>
+        <div className="text-[10px] font-bold uppercase tracking-wider text-white/80">
+          {block.defId === "fn.return" ? "Return" : "Process"}
+        </div>
         {fieldsContent}
       </div>
     );
   }
 
-  const showOut = category !== "conditions" && block.defId !== "start.stop";
+  const showOut = category !== "conditions" && block.defId !== "fn.return";
   const hasError = issues.some((i) => i.severity === "error");
   const outlineColor = selected ? "var(--color-primary)" : hasError ? "#ef4444" : unreachable ? "var(--color-border)" : "transparent";
   const outlineStyleKind = selected || hasError ? "solid" : "dashed";
@@ -1382,7 +1149,6 @@ function CanvasBlock({
           !
         </div>
       )}
-      {/* Input port (top) — every block */}
       <div
         data-no-drag
         onMouseEnter={() => onPortEnter("in")}
@@ -1410,7 +1176,6 @@ function CanvasBlock({
 
       {category === "conditions" ? (
         <>
-          {/* True port (right side) */}
           <div
             data-no-drag
             onMouseDown={(e) => {
@@ -1421,11 +1186,7 @@ function CanvasBlock({
             className="absolute right-0 top-1/2 z-10 h-4 w-4 translate-x-1/2 -translate-y-1/2 cursor-crosshair rounded-full border-2 border-background bg-emerald-500 shadow-soft transition-transform hover:scale-125"
             title="True"
           />
-          <span className="pointer-events-none absolute right-[-18px] top-[calc(50%+10px)] text-[9px] font-bold text-emerald-600">
-            T
-          </span>
-
-          {/* False port (left side) */}
+          <span className="pointer-events-none absolute right-[-18px] top-[calc(50%+10px)] text-[9px] font-bold text-emerald-600">T</span>
           <div
             data-no-drag
             onMouseDown={(e) => {
@@ -1436,15 +1197,12 @@ function CanvasBlock({
             className="absolute left-0 top-1/2 z-10 h-4 w-4 -translate-x-1/2 -translate-y-1/2 cursor-crosshair rounded-full border-2 border-background bg-rose-500 shadow-soft transition-transform hover:scale-125"
             title="False"
           />
-          <span className="pointer-events-none absolute left-[-18px] top-[calc(50%+10px)] text-[9px] font-bold text-rose-600">
-            F
-          </span>
+          <span className="pointer-events-none absolute left-[-18px] top-[calc(50%+10px)] text-[9px] font-bold text-rose-600">F</span>
         </>
       ) : (
         <>
           {category === "loops" && (
             <>
-              {/* Loop-back port (left side) — connect a body block's output here */}
               <div
                 data-no-drag
                 onMouseEnter={() => onPortEnter("loopback")}
@@ -1455,9 +1213,7 @@ function CanvasBlock({
                 )}
                 title="Loop back"
               />
-              <span className="pointer-events-none absolute -left-4 top-[calc(50%-16px)] text-[11px] text-violet-500">
-                ↺
-              </span>
+              <span className="pointer-events-none absolute -left-4 top-[calc(50%-16px)] text-[11px] text-violet-500">↺</span>
             </>
           )}
           {showOut && (
@@ -1523,13 +1279,6 @@ function InlineField({
   );
 }
 
-/**
- * Custom renderer for fn.call blocks: a dropdown to pick which saved
- * function to invoke, followed by one inline input per parameter that
- * specific function declares — reshaping live as the selection changes.
- * The selected function's id lives in block.values.__functionId; each
- * parameter's value lives under its own name, same as any other field.
- */
 function FnCallFields({
   block,
   functions,
@@ -1601,7 +1350,6 @@ function renderTemplate(template: string, fields: BlockField[]): Seg[] {
   return out.filter((s) => (s.type === "text" ? s.value.length > 0 : true));
 }
 
-/** Smooth flow connector (true/false branches and normal in→out flow). */
 function bezier(a: { x: number; y: number }, b: { x: number; y: number }) {
   const dy = Math.max(40, Math.abs(b.y - a.y) * 0.5);
   const dx = Math.max(20, Math.abs(b.x - a.x) * 0.3);
@@ -1613,68 +1361,48 @@ function bezier(a: { x: number; y: number }, b: { x: number; y: number }) {
   return `M ${a.x} ${a.y} C ${c1x} ${c1y}, ${c2x} ${c2y}, ${b.x} ${b.y}`;
 }
 
-/** Right-angle "goes around" connector used for loop-back arrows. */
 function elbowPath(a: { x: number; y: number }, b: { x: number; y: number }) {
   const dropY = a.y + 28;
   const sideX = Math.min(a.x, b.x) - 40;
   return `M ${a.x} ${a.y} L ${a.x} ${dropY} L ${sideX} ${dropY} L ${sideX} ${b.y} L ${b.x} ${b.y}`;
 }
 
-/**
- * Validation rules for beginner-friendly structural checks — surfaced as
- * per-block markers and a small non-blocking banner, not a popup dialog.
- */
-type ValidationIssue = { severity: "error" | "warning"; message: string };
+// ---- Validation (function-body flavor: entry is fn.start, not start.main) ----
 
+type ValidationIssue = { severity: "error" | "warning"; message: string };
 type ValidationResult = {
-  /** Per-block problems — rendered as a small red badge + hover tooltip
-   * on the specific block, per the "highlight, don't dialog" approach. */
   blockIssues: Map<string, ValidationIssue[]>;
-  /** Blocks that exist and may even be internally well-formed, but are
-   * never reached from any Start block — dead code. */
   unreachableIds: Set<string>;
-  /** Problems that can't be pinned to one block (e.g. "no Start block at
-   * all") — shown as a small banner instead of a per-block marker. */
   globalMessages: ValidationIssue[];
 };
 
-function computeValidation(
+function computeFunctionValidation(
   blocks: PlacedBlock[],
   connections: Connection[],
-  functionIds: Set<string> = new Set(),
+  functionIds: Set<string>,
 ): ValidationResult {
   const blockIssues = new Map<string, ValidationIssue[]>();
   const globalMessages: ValidationIssue[] = [];
-
   function addIssue(id: string, issue: ValidationIssue) {
     const list = blockIssues.get(id) ?? [];
     list.push(issue);
     blockIssues.set(id, list);
   }
+  if (blocks.length === 0) return { blockIssues, unreachableIds: new Set(), globalMessages };
 
-  if (blocks.length === 0) {
-    return { blockIssues, unreachableIds: new Set(), globalMessages };
-  }
-
-  // Rule: exactly one Start block.
-  const startBlocks = blocks.filter((b) => b.defId === "start.main");
+  const startBlocks = blocks.filter((b) => b.defId === "fn.start");
   if (startBlocks.length === 0) {
-    globalMessages.push({ severity: "warning", message: "No Start block — add one to define where the program begins." });
+    globalMessages.push({ severity: "warning", message: "No Function Start block — add one to mark where the function begins." });
   } else if (startBlocks.length > 1) {
-    globalMessages.push({ severity: "error", message: `${startBlocks.length} Start blocks found — only one is allowed.` });
-    startBlocks.forEach((b) => addIssue(b.instanceId, { severity: "error", message: "Only one Start block is allowed." }));
+    globalMessages.push({ severity: "error", message: `${startBlocks.length} Function Start blocks found — only one is allowed.` });
+    startBlocks.forEach((b) => addIssue(b.instanceId, { severity: "error", message: "Only one Function Start block is allowed." }));
   }
 
-  // Rule: at least one End block.
-  const endBlocks = blocks.filter((b) => b.defId === "start.stop");
-  if (endBlocks.length === 0) {
-    globalMessages.push({ severity: "warning", message: "Program has no End block." });
+  const hasReturn = blocks.some((b) => b.defId === "fn.return");
+  if (!hasReturn) {
+    globalMessages.push({ severity: "warning", message: "Function has no Return block — it will implicitly return None." });
   }
 
-  // Rule: every non-Start block should have something feeding into it;
-  // a Start block should lead somewhere. Covers both fully isolated
-  // blocks and blocks that only look connected because they have an
-  // outgoing wire but nothing upstream ever reaches them.
   const hasIncoming = new Set<string>();
   const outgoingPortsByBlock = new Map<string, Set<PortId>>();
   for (const c of connections) {
@@ -1686,18 +1414,15 @@ function computeValidation(
   for (const b of blocks) {
     const def = getBlockDef(b.defId);
     if (!def) continue;
-    const isStart = b.defId === "start.main";
+    const isStart = b.defId === "fn.start";
     const outs = outgoingPortsByBlock.get(b.instanceId) ?? new Set<PortId>();
 
     if (isStart) {
-      if (outs.size === 0) {
-        addIssue(b.instanceId, { severity: "warning", message: "Start block isn't connected to anything." });
-      }
+      if (outs.size === 0) addIssue(b.instanceId, { severity: "warning", message: "Function Start isn't connected to anything." });
     } else if (!hasIncoming.has(b.instanceId)) {
       addIssue(b.instanceId, { severity: "error", message: "Not connected — nothing leads into this block." });
     }
 
-    // Rule: decision (diamond) blocks need both Yes and No wired.
     if (def.category === "conditions") {
       const hasTrue = outs.has("true");
       const hasFalse = outs.has("false");
@@ -1710,15 +1435,10 @@ function computeValidation(
       }
     }
 
-    // Rule: a Loop block needs something wired to its body (the "out"
-    // port) — otherwise there's nothing to actually repeat.
     if (def.category === "loops" && outs.size === 0) {
       addIssue(b.instanceId, { severity: "warning", message: "Loop has no body connected." });
     }
 
-    // Rule: fn.call must reference a function that still exists — the
-    // library entry could be missing entirely (nothing picked yet) or
-    // have been deleted since this call was placed.
     if (b.defId === "fn.call") {
       const fid = b.values.__functionId;
       if (!fid) {
@@ -1729,8 +1449,6 @@ function computeValidation(
     }
   }
 
-  // Rule: unreachable blocks — dead code that exists and may even wire
-  // together fine internally, but is never reached from any Start block.
   const forwardAdjacency = new Map<string, string[]>();
   for (const c of connections) {
     if (!forwardAdjacency.has(c.from)) forwardAdjacency.set(c.from, []);
@@ -1742,34 +1460,24 @@ function computeValidation(
     const id = queue.shift()!;
     if (reachable.has(id)) continue;
     reachable.add(id);
-    for (const next of forwardAdjacency.get(id) ?? []) {
-      if (!reachable.has(next)) queue.push(next);
-    }
+    for (const next of forwardAdjacency.get(id) ?? []) if (!reachable.has(next)) queue.push(next);
   }
   const unreachableIds = new Set<string>();
   if (startBlocks.length > 0) {
-    for (const b of blocks) {
-      if (!reachable.has(b.instanceId)) unreachableIds.add(b.instanceId);
-    }
+    for (const b of blocks) if (!reachable.has(b.instanceId)) unreachableIds.add(b.instanceId);
   }
 
-  // Rule: infinite cycles — a cycle in the flow that does NOT go through
-  // a loop block's dedicated "loopback" port (the one sanctioned way to
-  // intentionally repeat) is almost certainly an accidental miswiring.
   const cycleAdjacency = new Map<string, string[]>();
   for (const c of connections) {
-    if (c.toPort === "loopback") continue; // legitimate repeat edge, not a bug
+    if (c.toPort === "loopback") continue;
     if (!cycleAdjacency.has(c.from)) cycleAdjacency.set(c.from, []);
     cycleAdjacency.get(c.from)!.push(c.to);
   }
-  const WHITE = 0;
-  const GRAY = 1;
-  const BLACK = 2;
+  const WHITE = 0, GRAY = 1, BLACK = 2;
   const color = new Map<string, number>();
   blocks.forEach((b) => color.set(b.instanceId, WHITE));
   const inCycle = new Set<string>();
   const stack: string[] = [];
-
   function dfs(id: string) {
     color.set(id, GRAY);
     stack.push(id);
@@ -1784,163 +1492,39 @@ function computeValidation(
     stack.pop();
     color.set(id, BLACK);
   }
-  for (const b of blocks) {
-    if (color.get(b.instanceId) === WHITE) dfs(b.instanceId);
-  }
+  for (const b of blocks) if (color.get(b.instanceId) === WHITE) dfs(b.instanceId);
   for (const id of inCycle) {
-    addIssue(id, {
-      severity: "error",
-      message: "Infinite loop detected — this cycle doesn't go through a Loop block's repeat connection.",
-    });
+    addIssue(id, { severity: "error", message: "Infinite loop detected — this cycle doesn't go through a Loop block's repeat connection." });
   }
 
   return { blockIssues, unreachableIds, globalMessages };
 }
 
-/**
- * Execution order for code gen / Run: DFS from root blocks (no incoming
- * connection), following every outgoing branch (true/false/loop body).
- * The visited guard means loop-back cycles terminate safely instead of
- * looping forever.
- */
-function orderByConnections(blocks: PlacedBlock[], connections: Connection[]): PlacedBlock[] {
-  if (blocks.length === 0) return blocks;
-  const byId = new Map(blocks.map((b) => [b.instanceId, b]));
-  const outgoing = new Map<string, Connection[]>();
-  const hasIncoming = new Set<string>();
-  for (const c of connections) {
-    if (!outgoing.has(c.from)) outgoing.set(c.from, []);
-    outgoing.get(c.from)!.push(c);
-    hasIncoming.add(c.to);
-  }
-  const roots = blocks.filter((b) => !hasIncoming.has(b.instanceId));
-  const visited = new Set<string>();
-  const result: PlacedBlock[] = [];
-  const walk = (id: string) => {
-    if (visited.has(id)) return;
-    visited.add(id);
-    const b = byId.get(id);
-    if (!b) return;
-    result.push(b);
-    const outs = outgoing.get(id) ?? [];
-    for (const c of outs) walk(c.to);
-  };
-  roots.sort((a, b) => a.y - b.y || a.x - b.x).forEach((r) => walk(r.instanceId));
-  // Any leftover (disconnected components) — append in insertion order
-  blocks.forEach((b) => walk(b.instanceId));
-  return result;
+// ---- Live preview: generates this function's own `def name(...):` ----
+
+function pythonIdentifier(name: string): string {
+  const cleaned = (name || "function")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, "_")
+    .replace(/^([0-9])/, "_$1")
+    .replace(/^_+|_+$/g, "");
+  return cleaned || "function";
 }
 
-function BottomPanel({
-  open,
-  onToggle,
-  python,
-  terminal,
-  logs,
-  onDownloadPython,
-}: {
-  open: boolean;
-  onToggle: () => void;
-  python: string;
-  terminal: string[];
-  logs: string[];
-  onDownloadPython: () => void;
-}) {
-  return (
-    <div
-      className={cn(
-        "flex shrink-0 flex-col border-t border-border bg-surface transition-all",
-        open ? "h-64" : "h-10",
-      )}
-    >
-      <Tabs defaultValue="python" className="flex min-h-0 flex-1 flex-col">
-        <div className="flex h-10 items-center justify-between border-b border-border px-2">
-          <TabsList className="h-8 bg-transparent p-0">
-            <TabsTrigger value="python" className="h-8 rounded-lg data-[state=active]:bg-muted data-[state=active]:shadow-none">
-              <Code2 className="mr-1.5 h-3.5 w-3.5" />
-              Generated Python
-            </TabsTrigger>
-            <TabsTrigger value="terminal" className="h-8 rounded-lg data-[state=active]:bg-muted data-[state=active]:shadow-none">
-              <TerminalSquare className="mr-1.5 h-3.5 w-3.5" />
-              Terminal
-            </TabsTrigger>
-            <TabsTrigger value="logs" className="h-8 rounded-lg data-[state=active]:bg-muted data-[state=active]:shadow-none">
-              <ScrollText className="mr-1.5 h-3.5 w-3.5" />
-              Logs
-            </TabsTrigger>
-          </TabsList>
-          <div className="flex items-center gap-1">
-            <button
-              onClick={onDownloadPython}
-              className="flex h-7 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-muted-foreground hover:bg-muted hover:text-foreground"
-              title="Download generated Python (.py)"
-            >
-              <FileDown className="h-3.5 w-3.5" />
-              Download .py
-            </button>
-            <button
-              onClick={onToggle}
-              className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
-              aria-label={open ? "Collapse panel" : "Expand panel"}
-            >
-              {open ? <ChevronDown className="h-4 w-4" /> : <ChevronUp className="h-4 w-4" />}
-            </button>
-          </div>
-        </div>
-        {open && (
-          <div className="min-h-0 flex-1 overflow-hidden">
-            <TabsContent value="python" className="scrollbar-thin m-0 h-full overflow-auto p-4">
-              <pre className="font-mono text-[12.5px] leading-relaxed text-foreground">
-                <code>{python}</code>
-              </pre>
-            </TabsContent>
-            <TabsContent value="terminal" className="scrollbar-thin m-0 h-full overflow-auto p-4">
-              {terminal.length === 0 ? (
-                <div className="text-xs text-muted-foreground">Terminal is empty. Press Run to execute.</div>
-              ) : (
-                <pre className="font-mono text-[12.5px] leading-relaxed text-foreground">{terminal.join("\n")}</pre>
-              )}
-            </TabsContent>
-            <TabsContent value="logs" className="scrollbar-thin m-0 h-full overflow-auto p-4">
-              {logs.length === 0 ? (
-                <div className="text-xs text-muted-foreground">No logs yet.</div>
-              ) : (
-                <ul className="space-y-1 font-mono text-[12px] text-muted-foreground">
-                  {logs.map((l, i) => (
-                    <li key={i}>{l}</li>
-                  ))}
-                </ul>
-              )}
-            </TabsContent>
-          </div>
-        )}
-      </Tabs>
-    </div>
-  );
-}
-
-/** One Python line (or multi-line string) for a single block, at the given indent. */
-function emitLine(
-  b: PlacedBlock,
-  indent: string,
-  functionsById: Map<string, SavedFunction>,
-  identifierById: Map<string, string>,
-): string {
+function previewEmitLine(b: PlacedBlock, indent: string, functionsById: Map<string, SavedFunction>): string {
   const v = b.values;
   switch (b.defId) {
-    case "start.main":
     case "fn.start":
       return `${indent}# Entry point`;
-    case "start.stop":
-      return `${indent}return`;
     case "out.print":
-      return `${indent}print(${py(v.text)})`;
+      return `${indent}print(${previewPy(v.text)})`;
     case "out.format":
-      return `${indent}${v.var || "msg"} = f${py(v.template)}`;
+      return `${indent}${v.var || "msg"} = f${previewPy(v.template)}`;
     case "input.text":
-      return `${indent}${v.var || "name"} = input(${py(v.prompt)} + ": ")`;
+      return `${indent}${v.var || "name"} = input(${previewPy(v.prompt)} + ": ")`;
     case "input.number":
-      return `${indent}${v.var || "value"} = float(input(${py(v.prompt)} + ": "))`;
+      return `${indent}${v.var || "value"} = float(input(${previewPy(v.prompt)} + ": "))`;
     case "var.set":
       return `${indent}${v.name || "x"} = ${v.value || "0"}`;
     case "var.get":
@@ -1956,24 +1540,24 @@ function emitLine(
       const fid: string | undefined = v.__functionId;
       const fn = fid ? functionsById.get(fid) : undefined;
       if (!fn) return `${indent}# Call function: none selected`;
-      const identifier = (fid && identifierById.get(fid)) ?? pythonIdentifier(fn.name);
+      const identifier = pythonIdentifier(fn.name);
       const args = fn.params.map((p) => v[p.name] || p.default || "None").join(", ");
       return `${indent}${identifier}(${args})`;
     }
     case "file.read":
-      return `${indent}${v.var || "data"} = open(${py(v.path)}).read()`;
+      return `${indent}${v.var || "data"} = open(${previewPy(v.path)}).read()`;
     case "file.write":
-      return `${indent}open(${py(v.path)}, "w").write(str(${v.var || "data"}))`;
+      return `${indent}open(${previewPy(v.path)}, "w").write(str(${v.var || "data"}))`;
     case "api.get":
-      return `${indent}${v.var || "response"} = requests.get(${py(v.url)})`;
+      return `${indent}${v.var || "response"} = requests.get(${previewPy(v.url)})`;
     case "api.post":
-      return `${indent}response = requests.post(${py(v.url)}, json=${v.body || "{}"})`;
+      return `${indent}response = requests.post(${previewPy(v.url)}, json=${v.body || "{}"})`;
     case "ai.chat":
-      return `${indent}${v.var || "reply"} = ai.chat(${py(v.prompt)})`;
+      return `${indent}${v.var || "reply"} = ai.chat(${previewPy(v.prompt)})`;
     case "ai.classify":
-      return `${indent}${v.var || "label"} = ai.classify(${py(v.text)})`;
+      return `${indent}${v.var || "label"} = ai.classify(${previewPy(v.text)})`;
     case "ai.image":
-      return `${indent}${v.var || "image"} = ai.image(${py(v.prompt)})`;
+      return `${indent}${v.var || "image"} = ai.image(${previewPy(v.prompt)})`;
     case "data.list":
       return `${indent}${v.name || "items"} = [${v.items || ""}]`;
     case "data.dict":
@@ -1985,75 +1569,50 @@ function emitLine(
   }
 }
 
-/** Sanitizes a user-provided display name into a valid-ish Python
- * identifier for def/call sites — names come from free text in the
- * Function Editor and can contain spaces, punctuation, etc. */
-function pythonIdentifier(name: string): string {
-  const cleaned = (name || "function")
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9_]+/g, "_")
-    .replace(/^([0-9])/, "_$1")
-    .replace(/^_+|_+$/g, "");
-  return cleaned || "function";
+function previewPy(s: string | undefined) {
+  const v = (s ?? "").replace(/"/g, '\\"');
+  return `"${v}"`;
 }
 
-/**
- * Walks the actual connection graph to produce properly nested Python:
- * - if.then follows its "true" port for the if-body and "false" port for
- *   the else-body, indented one level deeper.
- * - loop.for/loop.while follow their "out" port for the loop body,
- *   indented one level deeper.
- * - fn.return ends that path with a `return` line and never continues,
- *   the same way start.stop does for the main program.
- * - A block's "out" connection normally continues the chain at the same
- *   indent — except when it targets a loop's "loopback" port, which marks
- *   "repeat" rather than "continue on", so the chain stops there instead
- *   of recursing back into the loop header.
- * - A Connector block (small circle) is a merge/jump point: reaching one
- *   from any branch stops that branch there instead of inlining further
- *   code. Whichever if/else or loop produced that branch then continues
- *   the OUTER chain — at its own original indent — from the connector's
- *   "out" port.
- *
- * This is shared by both the main program body and every saved
- * function's body — a function's body is just another set of
- * blocks/connections with its own root(s).
- */
-type ChainResult = { lines: string[]; mergeConnectorId?: string };
+type PreviewChainResult = { lines: string[]; mergeConnectorId?: string };
 
-function generateBody(
+function generateFunctionPreview(
+  name: string,
+  params: FunctionParam[],
   blocks: PlacedBlock[],
   connections: Connection[],
-  functionsById: Map<string, SavedFunction>,
-  identifierById: Map<string, string>,
-  rootIds: string[],
+  functions: SavedFunction[],
 ): string {
-  if (blocks.length === 0) return "    pass";
+  const functionsById = new Map(functions.map((f) => [f.id, f]));
+  const identifier = pythonIdentifier(name);
+  const paramList = params.map((p) => (p.default ? `${p.name}=${p.default}` : p.name)).join(", ");
+
+  if (blocks.length === 0) {
+    return `def ${identifier}(${paramList}):\n    pass\n`;
+  }
 
   const byId = new Map(blocks.map((b) => [b.instanceId, b]));
   const outByPort = new Map<string, Connection>();
-  for (const c of connections) outByPort.set(`${c.from}:${c.fromPort}`, c);
-
+  const hasIncomingIn = new Set<string>();
+  for (const c of connections) {
+    outByPort.set(`${c.from}:${c.fromPort}`, c);
+    if (c.toPort === "in") hasIncomingIn.add(c.to);
+  }
   const visited = new Set<string>();
 
-  function continueFromMerge(mergeId: string | undefined, indent: string): ChainResult {
+  function continueFromMerge(mergeId: string | undefined, indent: string): PreviewChainResult {
     if (!mergeId) return { lines: [] };
     const afterConn = outByPort.get(`${mergeId}:out`);
     if (!afterConn) return { lines: [] };
     return genChain(afterConn.to, indent);
   }
 
-  function genChain(blockId: string, indent: string): ChainResult {
+  function genChain(blockId: string, indent: string): PreviewChainResult {
     const block = byId.get(blockId);
     if (!block) return { lines: [] };
     const def = getBlockDef(block.defId);
     if (!def) return { lines: [] };
-
-    if (def.category === "connector") {
-      return { lines: [], mergeConnectorId: blockId };
-    }
-
+    if (def.category === "connector") return { lines: [], mergeConnectorId: blockId };
     if (visited.has(blockId)) return { lines: [] };
     visited.add(blockId);
     const v = block.values;
@@ -2063,15 +1622,13 @@ function generateBody(
       const trueConn = outByPort.get(`${blockId}:true`);
       const trueResult = trueConn ? genChain(trueConn.to, indent + "    ") : { lines: [] };
       lines.push(...(trueResult.lines.length ? trueResult.lines : [`${indent}    pass`]));
-
-      let falseResult: ChainResult = { lines: [] };
+      let falseResult: PreviewChainResult = { lines: [] };
       const falseConn = outByPort.get(`${blockId}:false`);
       if (falseConn) {
         lines.push(`${indent}else:`);
         falseResult = genChain(falseConn.to, indent + "    ");
         lines.push(...(falseResult.lines.length ? falseResult.lines : [`${indent}    pass`]));
       }
-
       const mergeId = trueResult.mergeConnectorId ?? falseResult.mergeConnectorId;
       const after = continueFromMerge(mergeId, indent);
       lines.push(...after.lines);
@@ -2087,7 +1644,6 @@ function generateBody(
       const bodyConn = outByPort.get(`${blockId}:out`);
       const bodyResult = bodyConn ? genChain(bodyConn.to, indent + "    ") : { lines: [] };
       lines.push(...(bodyResult.lines.length ? bodyResult.lines : [`${indent}    pass`]));
-
       const after = continueFromMerge(bodyResult.mergeConnectorId, indent);
       lines.push(...after.lines);
       return { lines, mergeConnectorId: after.mergeConnectorId };
@@ -2097,10 +1653,8 @@ function generateBody(
       return { lines: [`${indent}return ${v.value || "None"}`] };
     }
 
-    const lines = [emitLine(block, indent, functionsById, identifierById)];
+    const lines = [previewEmitLine(block, indent, functionsById)];
     const next = outByPort.get(`${blockId}:out`);
-    // A connection into a loop's "loopback" port marks "repeat", not
-    // "continue on" — stop the chain here instead of recursing into it.
     if (next && next.toPort !== "loopback") {
       const nextResult = genChain(next.to, indent);
       lines.push(...nextResult.lines);
@@ -2108,6 +1662,11 @@ function generateBody(
     }
     return { lines };
   }
+
+  const roots = blocks.filter((b) => b.defId === "fn.start");
+  const rootIds = roots.length > 0
+    ? roots.map((b) => b.instanceId)
+    : blocks.filter((b) => !hasIncomingIn.has(b.instanceId)).sort((a, b) => a.y - b.y || a.x - b.x).map((b) => b.instanceId);
 
   const bodyLines: string[] = [];
   const runChainToEnd = (startId: string) => {
@@ -2119,108 +1678,10 @@ function generateBody(
     }
   };
   for (const r of rootIds) runChainToEnd(r);
-  // Anything never reached (disconnected islands) is still emitted so
-  // nothing dropped on the canvas silently disappears from the code.
   for (const b of blocks) {
-    if (!visited.has(b.instanceId) && getBlockDef(b.defId)?.category !== "connector") {
-      runChainToEnd(b.instanceId);
-    }
+    if (!visited.has(b.instanceId) && getBlockDef(b.defId)?.category !== "connector") runChainToEnd(b.instanceId);
   }
 
-  return bodyLines.length ? bodyLines.join("\n") : "    pass";
-}
-
-/** Root blocks for a body with no explicit dedicated entry block: those
- * with nothing feeding their "in" port. Used for the main program (whose
- * roots are just "whatever has no incoming connection") — a function
- * body instead roots specifically from its fn.start block(s). */
-function computeDefaultRoots(blocks: PlacedBlock[], connections: Connection[]): string[] {
-  const hasIncomingIn = new Set<string>();
-  for (const c of connections) if (c.toPort === "in") hasIncomingIn.add(c.to);
-  return blocks
-    .filter((b) => !hasIncomingIn.has(b.instanceId))
-    .sort((a, b) => a.y - b.y || a.x - b.x)
-    .map((b) => b.instanceId);
-}
-
-/** Walks every fn.call in `blocks`, and recursively into each called
- * function's own body (nested reuse), collecting every function id
- * transitively used. The `collected` guard means self-recursion and
- * mutual recursion between functions terminate safely instead of
- * looping forever — once a function's id is collected, its body is
- * scanned exactly once. */
-function collectCalledFunctionIds(
-  blocks: PlacedBlock[],
-  functionsById: Map<string, SavedFunction>,
-  collected: Set<string>,
-  depth = 0,
-) {
-  if (depth > 50) return; // defensive cap against pathological/malformed data
-  for (const b of blocks) {
-    if (b.defId !== "fn.call") continue;
-    const fid: string | undefined = b.values.__functionId;
-    if (!fid || collected.has(fid) || !functionsById.has(fid)) continue;
-    collected.add(fid);
-    const fn = functionsById.get(fid)!;
-    collectCalledFunctionIds((fn.blocks as PlacedBlock[]) ?? [], functionsById, collected, depth + 1);
-  }
-}
-
-function generatePython(
-  projectName: string | undefined,
-  blocks: PlacedBlock[],
-  connections: Connection[],
-  functions: SavedFunction[],
-) {
-  const functionsById = new Map(functions.map((f) => [f.id, f]));
-  const header = `# ${projectName ?? "Untitled"} — generated by NeuronBLK\n\n`;
-
-  if (blocks.length === 0) {
-    return (
-      header +
-      "def main():\n    # Drag blocks onto the canvas to generate code.\n    pass\n\nif __name__ == \"__main__\":\n    main()\n"
-    );
-  }
-
-  // Collect every function transitively reachable via fn.call so nested
-  // reuse (a saved function calling another saved function) is included.
-  const calledIds = new Set<string>();
-  collectCalledFunctionIds(blocks, functionsById, calledIds);
-
-  // Assign each a de-duplicated Python identifier up front — two saved
-  // functions can share a display name without colliding in the file.
-  const usedNames = new Set<string>();
-  const identifierById = new Map<string, string>();
-  for (const fid of calledIds) {
-    const fn = functionsById.get(fid)!;
-    const base = pythonIdentifier(fn.name);
-    let candidate = base;
-    let n = 2;
-    while (usedNames.has(candidate)) candidate = `${base}_${n++}`;
-    usedNames.add(candidate);
-    identifierById.set(fid, candidate);
-  }
-
-  const defSections = [...calledIds].map((fid) => {
-    const fn = functionsById.get(fid)!;
-    const fnBlocks = (fn.blocks as PlacedBlock[]) ?? [];
-    const fnConnections = (fn.connections as Connection[]) ?? [];
-    const startBlocks = fnBlocks.filter((b) => b.defId === "fn.start");
-    const rootIds =
-      startBlocks.length > 0 ? startBlocks.map((b) => b.instanceId) : computeDefaultRoots(fnBlocks, fnConnections);
-    const paramList = fn.params.map((p) => (p.default ? `${p.name}=${p.default}` : p.name)).join(", ");
-    const body = generateBody(fnBlocks, fnConnections, functionsById, identifierById, rootIds);
-    return `def ${identifierById.get(fid)}(${paramList}):\n${body}\n`;
-  });
-
-  const mainRootIds = computeDefaultRoots(blocks, connections);
-  const mainBody = generateBody(blocks, connections, functionsById, identifierById, mainRootIds);
-
-  const defsBlock = defSections.length > 0 ? defSections.join("\n") + "\n" : "";
-  return `${header}${defsBlock}def main():\n${mainBody}\n\nif __name__ == "__main__":\n    main()\n`;
-}
-
-function py(s: string | undefined) {
-  const v = (s ?? "").replace(/"/g, '\\"');
-  return `"${v}"`;
+  const body = bodyLines.length ? bodyLines.join("\n") : "    pass";
+  return `def ${identifier}(${paramList}):\n${body}\n`;
 }
