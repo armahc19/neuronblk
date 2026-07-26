@@ -1575,6 +1575,21 @@ function FnCallFields({
           style={{ width: 80 }}
         />
       ))}
+      {selected && (
+        <>
+          <span className="text-[11px] font-medium text-white/80">→</span>
+          <input
+            data-no-drag
+            value={block.values.__resultVar ?? ""}
+            placeholder="store as (optional)"
+            onChange={(e) => onFieldChange("__resultVar", e.target.value)}
+            onFocus={onFocus}
+            onMouseDown={(e) => e.stopPropagation()}
+            className="h-7 rounded-full border-0 bg-white/95 px-2.5 text-[12.5px] font-medium text-foreground shadow-soft outline-none placeholder:text-muted-foreground focus:ring-2 focus:ring-white"
+            style={{ width: 110 }}
+          />
+        </>
+      )}
     </div>
   );
 }
@@ -1934,7 +1949,7 @@ function emitLine(
     case "start.stop":
       return `${indent}return`;
     case "out.print":
-      return `${indent}print(${py(v.text)})`;
+      return `${indent}print(f${py(v.text)})`;
     case "out.format":
       return `${indent}${v.var || "msg"} = f${py(v.template)}`;
     case "input.text":
@@ -1958,7 +1973,8 @@ function emitLine(
       if (!fn) return `${indent}# Call function: none selected`;
       const identifier = (fid && identifierById.get(fid)) ?? pythonIdentifier(fn.name);
       const args = fn.params.map((p) => v[p.name] || p.default || "None").join(", ");
-      return `${indent}${identifier}(${args})`;
+      const resultVar = v.__resultVar?.trim();
+      return resultVar ? `${indent}${resultVar} = ${identifier}(${args})` : `${indent}${identifier}(${args})`;
     }
     case "file.read":
       return `${indent}${v.var || "data"} = open(${py(v.path)}).read()`;
