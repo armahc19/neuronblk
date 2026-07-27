@@ -5,16 +5,8 @@ type PyodideInterface = import("pyodide").PyodideInterface;
 
 let pyodidePromise: Promise<PyodideInterface> | null = null;
 
-/** Injected before user code — async input(), AI/HTTP stubs for browser execution. */
+/** Injected before user code — AI/HTTP stubs for browser execution. */
 const RUNTIME_PREAMBLE = `
-import builtins
-from pyodide.ffi import run_sync
-
-def _neuronblk_input(prompt=""):
-    return run_sync(neuronblk_input(str(prompt) if prompt is not None else ""))
-
-builtins.input = _neuronblk_input
-
 class _NeuronAI:
     @staticmethod
     def chat(prompt):
@@ -53,6 +45,34 @@ class _Requests:
 
 requests = _Requests()
 `;
+
+/**
+ * Browser execution uses runPythonAsync + terminal prompts (Promises). That
+ * path does not need JSPI/stack-switching (run_sync). Rewrite sync generated
+ * code into async/await form only for in-browser runs — exported .py stays sync.
+ */
+function transformCodeForBrowser(code: string): string {
+  const funcNames: string[] = [];
+  for (const m of code.matchAll(/^def (\w+)\(/gm)) {
+    funcNames.push(m[1]);
+  }
+
+  let out = code.replace(/^def /gm, "async def ");
+  out = out.replace(/\binput\(/g, "await neuronblk_input(");
+
+  for (const name of funcNames) {
+    const callRe = new RegExp(String.raw`(?<!(?:async )?def )(?<![.\w])${name}\(`, "g");
+    out = out.replace(callRe, `await ${name}(`);
+  }
+
+  out = out.replace(/\bawait await /g, "await ");
+
+  // Top-level await is supported by runPythonAsync; drop the __main__ guard.
+  out = out.replace(/if __name__ == ["']__main__["']:\s*\n\s*await main\(\)\s*\n?$/m, "");
+  out = out.trimEnd() + "\n\nawait main()\n";
+
+  return out;
+}
 
 export type RunPythonOptions = {
   code: string;
@@ -109,7 +129,8 @@ export async function runPython(options: RunPythonOptions): Promise<RunPythonRes
 
     onStatus?.("Running…");
 
-    const fullCode = `${RUNTIME_PREAMBLE}\n${code}`;
+    const asyncCode = transformCodeForBrowser(code);
+    const fullCode = `${RUNTIME_PREAMBLE}\n${asyncCode}`;
     const globals = pyodide.runPython(`dict(__name__="__main__")`);
     globals.set("neuronblk_input", (prompt: string) => onInput(prompt ?? ""));
 
