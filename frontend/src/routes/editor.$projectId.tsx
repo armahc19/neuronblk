@@ -33,6 +33,7 @@ import { Toaster } from "@/components/ui/sonner";
 import { BLOCK_CATEGORIES, getBlockDef, type BlockDef, type BlockField } from "@/lib/blocks";
 import { projectStore, type Project } from "@/lib/projectStore";
 import { functionStore, type SavedFunction } from "@/lib/functionStore";
+import { runPython } from "@/lib/pyodideRunner";
 import { pullFromServer } from "@/lib/sync";
 import { cn } from "@/lib/utils";
 
@@ -124,6 +125,10 @@ function Editor() {
   const [logs, setLogs] = useState<string[]>([]);
   const [terminal, setTerminal] = useState<string[]>([]);
   const [ranOnce, setRanOnce] = useState(false);
+  const [bottomTab, setBottomTab] = useState<"python" | "terminal" | "logs">("python");
+  const [inputPrompt, setInputPrompt] = useState<string | null>(null);
+  const [inputDraft, setInputDraft] = useState("");
+  const inputResolveRef = useRef<((value: string) => void) | null>(null);
   const canvasRef = useRef<HTMLDivElement>(null);
   const placedRef = useRef<PlacedBlock[]>(placed);
   useEffect(() => {
@@ -458,7 +463,6 @@ function Editor() {
     })).filter((c) => c.blocks.length > 0);
   }, [query]);
 
-  const orderedBlocks = useMemo(() => orderByConnections(placed, connections), [placed, connections]);
   const validation = useMemo(
     () => computeValidation(placed, connections, new Set(functions.map((f) => f.id))),
     [placed, connections, functions],
@@ -609,25 +613,92 @@ function Editor() {
     return () => clearTimeout(timer);
   }, [project, placed, connections]);
 
-  function handleRun() {
+  function appendLog(msg: string) {
+    setLogs((l) => [...l, `[${new Date().toLocaleTimeString()}] ${msg}`]);
+  }
+
+  function requestInput(prompt: string): Promise<string> {
+    return new Promise((resolve) => {
+      setInputPrompt(prompt || "Input:");
+      setInputDraft("");
+      inputResolveRef.current = resolve;
+      setBottomTab("terminal");
+    });
+  }
+
+  function submitInput() {
+    const resolve = inputResolveRef.current;
+    if (!resolve) return;
+    inputResolveRef.current = null;
+    setInputPrompt(null);
+    const value = inputDraft;
+    setInputDraft("");
+    setTerminal((t) => [...t, value]);
+    resolve(value);
+  }
+
+  function cancelInput() {
+    const resolve = inputResolveRef.current;
+    if (!resolve) return;
+    inputResolveRef.current = null;
+    setInputPrompt(null);
+    setInputDraft("");
+    resolve("");
+  }
+
+  async function handleRun() {
+    if (running) return;
     setRunning(true);
     setBottomOpen(true);
-    setTerminal([]);
-    setLogs([`[${new Date().toLocaleTimeString()}] Starting run…`]);
-    setTimeout(() => {
-      if (placed.length === 0) {
-        setLogs((l) => [...l, `[${new Date().toLocaleTimeString()}] No blocks on the canvas. Nothing to run.`]);
-      } else {
-        setTerminal([
-          "> python main.py",
-          ...orderedBlocks.map((b) => `→ ${getBlockDef(b.defId)?.label ?? b.defId}`),
-          "Done in 0.42s",
-        ]);
-        setLogs((l) => [...l, `[${new Date().toLocaleTimeString()}] Run finished successfully.`]);
-      }
+    setBottomTab("terminal");
+    setTerminal(["> python main.py"]);
+    setLogs([]);
+    appendLog("Starting run…");
+
+    if (placed.length === 0) {
+      appendLog("No blocks on the canvas. Nothing to run.");
       setRunning(false);
-      setRanOnce(true);
-    }, 800);
+      return;
+    }
+
+    const stdoutBufferRef = { value: "" };
+
+    const result = await runPython({
+      code: generatedPython,
+      onInput: requestInput,
+      onStdout: (chunk) => {
+        stdoutBufferRef.value += chunk;
+        const outputLines = stdoutBufferRef.value.split("\n");
+        setTerminal(["> python main.py", ...outputLines.filter((l, i, a) => l || i < a.length - 1)]);
+      },
+      onStderr: (chunk) => {
+        setTerminal((t) => [...t, `[stderr] ${chunk}`]);
+      },
+      onStatus: appendLog,
+    });
+
+    if (inputResolveRef.current) cancelInput();
+
+    const secs = (result.durationMs / 1000).toFixed(2);
+    const outputLines = result.stdout ? result.stdout.split("\n") : [];
+    const stderrLines = result.stderr ? result.stderr.split("\n").map((l) => `[stderr] ${l}`) : [];
+
+    if (result.success) {
+      setTerminal(["> python main.py", ...outputLines, ...stderrLines, "", `Done in ${secs}s`]);
+      appendLog(`Run finished successfully (${secs}s).`);
+    } else {
+      setTerminal([
+        "> python main.py",
+        ...outputLines,
+        ...stderrLines,
+        "",
+        `Error: ${result.error ?? "Unknown error"}`,
+      ]);
+      appendLog(`Run failed: ${result.error ?? "Unknown error"}`);
+    }
+
+    setRunning(false);
+    setRanOnce(true);
   }
 
   function handleDragOver(e: React.DragEvent) {
@@ -1037,9 +1108,17 @@ function Editor() {
           <BottomPanel
             open={bottomOpen}
             onToggle={() => setBottomOpen((o) => !o)}
+            tab={bottomTab}
+            onTabChange={setBottomTab}
             python={generatedPython}
             terminal={terminal}
             logs={logs}
+            running={running}
+            inputPrompt={inputPrompt}
+            inputDraft={inputDraft}
+            onInputDraftChange={setInputDraft}
+            onInputSubmit={submitInput}
+            onInputCancel={cancelInput}
             onDownloadPython={downloadPython}
           />
         </div>
@@ -1069,9 +1148,9 @@ function Editor() {
               <div className="space-y-3">
                 <div className="rounded-xl border border-border bg-background p-3 text-xs">
                   <div className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Program output</div>
-                  <div className="font-mono text-foreground">
-                    {terminal.length ? terminal[terminal.length - 2] ?? "—" : "No output yet"}
-                  </div>
+                  <pre className="max-h-32 overflow-auto whitespace-pre-wrap font-mono text-foreground">
+                    {terminal.filter((l) => !l.startsWith(">") && !l.startsWith("Done in")).join("\n") || "No output yet"}
+                  </pre>
                 </div>
                 <div className="rounded-xl border border-border bg-background p-3 text-xs">
                   <div className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Blocks executed</div>
@@ -1849,16 +1928,32 @@ function orderByConnections(blocks: PlacedBlock[], connections: Connection[]): P
 function BottomPanel({
   open,
   onToggle,
+  tab,
+  onTabChange,
   python,
   terminal,
   logs,
+  running,
+  inputPrompt,
+  inputDraft,
+  onInputDraftChange,
+  onInputSubmit,
+  onInputCancel,
   onDownloadPython,
 }: {
   open: boolean;
   onToggle: () => void;
+  tab: "python" | "terminal" | "logs";
+  onTabChange: (tab: "python" | "terminal" | "logs") => void;
   python: string;
   terminal: string[];
   logs: string[];
+  running: boolean;
+  inputPrompt: string | null;
+  inputDraft: string;
+  onInputDraftChange: (v: string) => void;
+  onInputSubmit: () => void;
+  onInputCancel: () => void;
   onDownloadPython: () => void;
 }) {
   return (
@@ -1868,7 +1963,7 @@ function BottomPanel({
         open ? "h-64" : "h-10",
       )}
     >
-      <Tabs defaultValue="python" className="flex min-h-0 flex-1 flex-col">
+      <Tabs value={tab} onValueChange={(v) => onTabChange(v as "python" | "terminal" | "logs")} className="flex min-h-0 flex-1 flex-col">
         <div className="flex h-10 items-center justify-between border-b border-border px-2">
           <TabsList className="h-8 bg-transparent p-0">
             <TabsTrigger value="python" className="h-8 rounded-lg data-[state=active]:bg-muted data-[state=active]:shadow-none">
@@ -1909,11 +2004,40 @@ function BottomPanel({
                 <code>{python}</code>
               </pre>
             </TabsContent>
-            <TabsContent value="terminal" className="scrollbar-thin m-0 h-full overflow-auto p-4">
-              {terminal.length === 0 ? (
-                <div className="text-xs text-muted-foreground">Terminal is empty. Press Run to execute.</div>
-              ) : (
-                <pre className="font-mono text-[12.5px] leading-relaxed text-foreground">{terminal.join("\n")}</pre>
+            <TabsContent value="terminal" className="scrollbar-thin m-0 flex h-full flex-col overflow-hidden p-4">
+              <div className="min-h-0 flex-1 overflow-auto">
+                {terminal.length === 0 && !running ? (
+                  <div className="text-xs text-muted-foreground">Terminal is empty. Press Run to execute.</div>
+                ) : (
+                  <pre className="font-mono text-[12.5px] leading-relaxed text-foreground">{terminal.join("\n")}</pre>
+                )}
+                {running && terminal.length <= 1 && (
+                  <div className="mt-2 text-xs text-muted-foreground animate-pulse">Running Python in browser…</div>
+                )}
+              </div>
+              {inputPrompt !== null && (
+                <form
+                  className="mt-3 flex shrink-0 items-center gap-2 border-t border-border pt-3"
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    onInputSubmit();
+                  }}
+                >
+                  <span className="shrink-0 font-mono text-[12px] text-muted-foreground">{inputPrompt}</span>
+                  <Input
+                    autoFocus
+                    value={inputDraft}
+                    onChange={(e) => onInputDraftChange(e.target.value)}
+                    className="h-8 flex-1 rounded-lg font-mono text-[12px]"
+                    placeholder="Your input…"
+                  />
+                  <Button type="submit" size="sm" className="h-8 rounded-lg px-3">
+                    Send
+                  </Button>
+                  <Button type="button" size="sm" variant="ghost" className="h-8 rounded-lg" onClick={onInputCancel}>
+                    Skip
+                  </Button>
+                </form>
               )}
             </TabsContent>
             <TabsContent value="logs" className="scrollbar-thin m-0 h-full overflow-auto p-4">
